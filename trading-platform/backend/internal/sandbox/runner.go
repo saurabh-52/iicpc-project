@@ -4,7 +4,9 @@ package sandbox
 import (
 	"context"
 	"fmt"
-	"path/filepath" // <--- Add this import
+	"io"
+	"os"
+	"path/filepath"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
@@ -52,5 +54,34 @@ func ExecuteCode(filePath string, language string) error {
 	}
 
 	fmt.Printf("Sandbox started successfully with ID: %s\n", resp.ID)
+	
+	
+	// 5. Wait for the container to finish executing
+    statusCh, errCh := cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
+	select {
+	case err := <-errCh:
+		if err != nil {
+			return fmt.Errorf("error waiting for container: %v", err)
+		}
+	case <-statusCh:
+	}
+
+	// 6. Retrieve the logs (stdout and stderr)
+	out, err := cli.ContainerLogs(ctx, resp.ID, container.LogsOptions{ShowStdout: true, ShowStderr: true})
+	if err != nil {
+		return fmt.Errorf("failed to get logs: %v", err)
+	}
+	defer out.Close()
+
+	// 7. Stream logs to your Go console for now
+	fmt.Println("--- Contestant Output ---")
+	io.Copy(os.Stdout, out)
+	fmt.Println("-------------------------")
+
+	// 8. Cleanup: Remove the container after test
+	cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
+
 	return nil
+
+
 }
