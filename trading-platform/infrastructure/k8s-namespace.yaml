@@ -1,0 +1,48 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: trading-sandbox
+  labels:
+    app: trading-platform
+---
+# RBAC: ServiceAccount for backend pods
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: trading-backend
+  namespace: trading-sandbox
+---
+# RBAC: Role for pod and service creation/management
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: trading-backend-executor
+  namespace: trading-sandbox
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create", "get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+# RBAC: RoleBinding to bind role to service account
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: trading-backend-executor-binding
+  namespace: trading-sandbox
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: trading-backend-executor
+subjects:
+  - kind: ServiceAccount
+    name: trading-backend
+    namespace: trading-sandbox

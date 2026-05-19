@@ -1,0 +1,49 @@
+import { BrowserRouter as Router, Routes, Route, Link, useLocation } from 'react-router-dom';
+import './App.css';
+import SubmitPage from './pages/SubmitPage';
+import Dashboard from './pages/Dashboard';
+
+function Shell() {
+  const location = useLocation();
+  const isSubmitPage = location.pathname === '/submit';
+
+  return (
+    <div className="app-shell">
+      <header className="topbar">
+        <div className="brand-lockup">
+          <div className="brand-mark">TP</div>
+          <div>
+            <p className="eyebrow">Trading Platform</p>
+            <h1 className="brand-title">Operational control for engines and stress tests</h1>
+          </div>
+        </div>
+
+        <nav className="nav-actions" aria-label="Primary navigation">
+          <Link className={isSubmitPage ? 'nav-link' : 'nav-link active'} to="/">
+            Dashboard
+          </Link>
+          <Link className={isSubmitPage ? 'nav-link active' : 'nav-link'} to="/submit">
+            Submit engine
+          </Link>
+        </nav>
+      </header>
+
+      <main className="page-frame">
+        <Routes>
+          <Route path="/" element={<Dashboard />} />
+          <Route path="/submit" element={<SubmitPage />} />
+        </Routes>
+      </main>
+    </div>
+  );
+}
+
+function App() {
+  return (
+    <Router>
+      <Shell />
+    </Router>
+  );
+}
+
+export default App;
