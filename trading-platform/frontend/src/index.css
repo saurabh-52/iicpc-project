@@ -1,0 +1,66 @@
+:root {
+  --text: #4b5563;
+  --text-h: #0f172a;
+  --bg: #f5f7fb;
+  --border: #dbe4f0;
+  --code-bg: #eef2ff;
+  --shadow: rgba(15, 23, 42, 0.08) 0 18px 40px;
+  --sans: 'Inter', 'Segoe UI', system-ui, sans-serif;
+  --heading: 'Inter', 'Segoe UI', system-ui, sans-serif;
+  --mono: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+
+  font: 16px/1.5 var(--sans);
+  color: var(--text);
+  background:
+    radial-gradient(circle at top left, rgba(96, 165, 250, 0.18), transparent 30%),
+    radial-gradient(circle at bottom right, rgba(168, 85, 247, 0.12), transparent 28%),
+    var(--bg);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+}
+
+body,
+button,
+input,
+select {
+  font-family: var(--sans);
+}
+
+a {
+  color: inherit;
+}
+
+#root {
+  min-height: 100svh;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin-top: 0;
+}
+
+p {
+  margin-bottom: 0;
+}
+
+::selection {
+  background: rgba(37, 99, 235, 0.18);
+  color: var(--text-h);
+}
