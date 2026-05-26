@@ -6,7 +6,7 @@ $ErrorActionPreference = "Stop"
 # Configuration
 $BACKEND_DIR = ".\trading-platform\backend"
 $IMAGE_NAME = "trading-platform/backend"
-$IMAGE_TAG = "latest"
+$IMAGE_TAG = "minikube"
 $FULL_IMAGE = "$IMAGE_NAME`:$IMAGE_TAG"
 $NAMESPACE = "trading-sandbox"
 
