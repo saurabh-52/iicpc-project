@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import { Link } from 'react-router-dom';
 
 export default function SubmitPage() {
@@ -13,11 +13,13 @@ export default function SubmitPage() {
     systemName: '',
     port: '8080',
     language: 'cpp',
-    protocol: 'websocket',
+    protocol: 'http',
     strategy: 'bbo_heavy',
     file: null
   });
   const [submitState, setSubmitState] = useState({ type: '', message: '' });
+  const [executionResult, setExecutionResult] = useState(null);
+  const [stressTestResult, setStressTestResult] = useState(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const handleChange = (e) => {
@@ -28,10 +30,24 @@ export default function SubmitPage() {
     }));
   };
 
+  const handleCleanup = async () => {
+    if (!executionResult?.pod_id) return;
+    try {
+      await fetch(`/api/sandbox/${executionResult.pod_id}`, { method: 'DELETE' });
+      setSubmitState({ type: 'success', message: 'Sandbox cleaned up.' });
+      setExecutionResult(null);
+      setStressTestResult(null);
+    } catch {
+      setSubmitState({ type: 'error', message: 'Cleanup failed.' });
+    }
+  };
+
   const handleSubmit = async (e) => {
     e.preventDefault();
     setIsSubmitting(true);
     setSubmitState({ type: '', message: '' });
+    setExecutionResult(null);
+    setStressTestResult(null);
 
     const selectedFile = formData.file;
     if (!selectedFile) {
@@ -92,10 +108,62 @@ export default function SubmitPage() {
         throw new Error(result?.message || `Submission failed with status ${response.status}`);
       }
 
+      const sandboxExecution = result?.execution_result || null;
       setSubmitState({
         type: 'success',
         message: result?.message || 'Engine submitted successfully.',
       });
+
+      setExecutionResult(sandboxExecution);
+
+      // Trigger stress test when the engine is actively Running (not Succeeded).
+      // Trading engines are long-running servers — they never "complete".
+      // The backend now returns a target_url based on the NodePort.
+      if (sandboxExecution?.target_url && sandboxExecution?.phase === 'Running') {
+        const stressResponse = await fetch('/api/stress-test', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            target: sandboxExecution.target_url,
+            protocol: formData.protocol,
+            strategy: formData.strategy,
+            bots: 16,
+            requests: 48,
+            timeout_ms: 2000,
+            method: 'POST',
+            path: '/',
+            expect_reply: formData.protocol === 'tcp',
+          }),
+        });
+
+        const stressText = await stressResponse.text();
+        let stressResult = null;
+
+        if (stressText) {
+          try {
+            stressResult = JSON.parse(stressText);
+          } catch {
+            stressResult = { message: stressText };
+          }
+        }
+
+        if (!stressResponse.ok) {
+          throw new Error(stressResult?.error || stressResult?.message || `Stress test failed with status ${stressResponse.status}`);
+        }
+
+        setStressTestResult(stressResult?.metrics || null);
+        setSubmitState({
+          type: 'success',
+          message: `${result?.message || 'Engine submitted successfully.'} Stress test launched with ${formData.strategy}.`,
+        });
+      } else if (sandboxExecution) {
+        setSubmitState({
+          type: 'success',
+          message: `${result?.message || 'Engine submitted successfully.'} Stress test skipped because the sandbox did not report success (phase: ${sandboxExecution.phase}).`,
+        });
+      }
     } catch (error) {
       setSubmitState({
         type: 'error',
@@ -176,10 +244,8 @@ export default function SubmitPage() {
             <label className="field">
               <span>Protocol</span>
               <select name="protocol" value={formData.protocol} onChange={handleChange}>
-                <option value="websocket">WebSocket</option>
+                <option value="http">HTTP / REST</option>
                 <option value="tcp">Raw TCP</option>
-                <option value="grpc">gRPC</option>
-                <option value="http">HTTP/REST</option>
               </select>
             </label>
           </div>
@@ -203,8 +269,95 @@ export default function SubmitPage() {
             <div className={`feedback ${submitState.type}`}>{submitState.message}</div>
           ) : null}
 
+          {executionResult ? (
+            <section className="result-panel">
+              <div className="result-row">
+                <span>Pod ID</span>
+                <strong>{executionResult.pod_id}</strong>
+              </div>
+              <div className="result-row">
+                <span>Service</span>
+                <strong>{executionResult.service_name}</strong>
+              </div>
+              <div className="result-row">
+                <span>Phase</span>
+                <strong>{executionResult.phase}</strong>
+              </div>
+              {executionResult.node_port ? (
+                <div className="result-row">
+                  <span>NodePort</span>
+                  <strong>{executionResult.node_port}</strong>
+                </div>
+              ) : null}
+              {executionResult.target_url ? (
+                <div className="result-row">
+                  <span>Target</span>
+                  <strong>{executionResult.target_url}</strong>
+                </div>
+              ) : null}
+              <button
+                type="button"
+                className="button button-secondary"
+                style={{ marginTop: '0.5rem', fontSize: '0.85rem', padding: '0.6rem 1rem' }}
+                onClick={handleCleanup}
+              >
+                🗑️ Cleanup sandbox
+              </button>
+            </section>
+          ) : null}
+
+          {stressTestResult ? (
+            <section className="result-panel">
+              <div className="result-row">
+                <span>Strategy</span>
+                <strong>{stressTestResult.strategy}</strong>
+              </div>
+              <div className="result-row">
+                <span>Target</span>
+                <strong>{stressTestResult.target}</strong>
+              </div>
+              <div className="result-row">
+                <span>Requests</span>
+                <strong>{stressTestResult.requests}</strong>
+              </div>
+              <div className="result-row">
+                <span>Successes</span>
+                <strong>{stressTestResult.successes}</strong>
+              </div>
+              <div className="result-row">
+                <span>Failures</span>
+                <strong>{stressTestResult.failures}</strong>
+              </div>
+              <div className="result-row">
+                <span>TPS</span>
+                <strong>
+                  {stressTestResult.requests_per_second != null
+                    ? stressTestResult.requests_per_second.toFixed(1)
+                    : '—'}
+                </strong>
+              </div>
+              <div className="result-output">
+                <span>Latency summary</span>
+                <pre>
+                  {stressTestResult.avg_latency_ms != null
+                    ? `avg: ${stressTestResult.avg_latency_ms.toFixed(2)}ms\n`
+                    : ''}
+                  {stressTestResult.p50_latency_ms != null
+                    ? `p50: ${stressTestResult.p50_latency_ms.toFixed(2)}ms\n`
+                    : ''}
+                  {stressTestResult.p90_latency_ms != null
+                    ? `p90: ${stressTestResult.p90_latency_ms.toFixed(2)}ms\n`
+                    : ''}
+                  {stressTestResult.p99_latency_ms != null
+                    ? `p99: ${stressTestResult.p99_latency_ms.toFixed(2)}ms`
+                    : ''}
+                </pre>
+              </div>
+            </section>
+          ) : null}
+
           <button type="submit" className="button button-primary submit-button" disabled={isSubmitting}>
-            {isSubmitting ? 'Submitting...' : 'Deploy and test'}
+            {isSubmitting ? 'Submitting...' : 'Deploy and launch stress test'}
           </button>
         </form>
       </section>

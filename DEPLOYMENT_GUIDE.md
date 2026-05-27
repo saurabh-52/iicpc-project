@@ -5,6 +5,7 @@
 ### Prerequisites
 
 Ensure you have:
+
 - Docker Desktop (or similar) with Kubernetes enabled
 - `kubectl` configured to access your Kubernetes cluster
 - Go 1.25+ (for local development)
@@ -13,11 +14,13 @@ Ensure you have:
 ### Build and Deploy in One Command
 
 **Windows (PowerShell):**
+
 ```powershell
 .\build-and-deploy.ps1
 ```
 
 **macOS/Linux (Bash):**
+
 ```bash
 ./build-and-deploy.sh
 ```
@@ -30,7 +33,7 @@ Navigate to the trading-platform directory and build the backend image:
 
 ```bash
 cd trading-platform/backend
-docker build -t trading-platform/backend:latest -f Dockerfile .
+docker build -t trading-platform/backend:minikube -f Dockerfile .
 cd ../..
 ```
 
@@ -43,6 +46,7 @@ kubectl apply -f infrastructure/k8s-namespace.yaml
 ```
 
 This creates:
+
 - `trading-sandbox` namespace
 - `trading-backend` ServiceAccount with permissions to create/delete pods and services
 - Required RBAC roles and bindings
@@ -56,6 +60,7 @@ kubectl apply -f infrastructure/backend-deployment.yaml
 ```
 
 This creates:
+
 - A Kubernetes Deployment for the backend
 - A LoadBalancer Service exposing the API on port 3000
 
@@ -83,14 +88,14 @@ kubectl logs -n trading-sandbox -l app=trading-platform,component=backend -f
 
 The backend is now deployed as a Kubernetes Deployment with the following configuration:
 
-- **Image**: `trading-platform/backend:latest` (built from Dockerfile)
+- **Image**: `trading-platform/backend:minikube` (built from Dockerfile)
 - **Replicas**: 1
 - **Namespace**: `trading-sandbox`
 - **ServiceAccount**: `trading-backend` (has permissions to create sandbox pods)
-- **Resource Limits**: 
+- **Resource Limits**:
   - Memory: 512Mi limit, 256Mi request
   - CPU: 500m limit, 250m request
-- **Health Checks**: 
+- **Health Checks**:
   - Liveness probe: `/health` endpoint every 20 seconds
   - Readiness probe: `/health` endpoint every 10 seconds
 - **Port**: 3000 (exposed via LoadBalancer service)
@@ -109,6 +114,7 @@ The backend is now deployed as a Kubernetes Deployment with the following config
 ## Kubernetes Pod Isolation
 
 Each submission creates an isolated Kubernetes Pod with:
+
 - Read-only volume mount for source code
 - Resource limits (memory and CPU)
 - Network policies (configurable)
@@ -125,6 +131,7 @@ The backend exposes a health check endpoint at `/health` that returns:
 ```
 
 This is used by Kubernetes probes to determine if the pod is:
+
 - **Alive** (liveness probe)
 - **Ready** to serve traffic (readiness probe)
 
@@ -133,11 +140,13 @@ This is used by Kubernetes probes to determine if the pod is:
 ### Backend Pod Not Starting
 
 Check logs:
+
 ```bash
 kubectl logs -n trading-sandbox deploy/trading-backend
 ```
 
 Describe deployment:
+
 ```bash
 kubectl describe deployment trading-backend -n trading-sandbox
 ```
@@ -145,6 +154,7 @@ kubectl describe deployment trading-backend -n trading-sandbox
 ### Image Pull Failures
 
 If using a registry other than Docker Hub, ensure:
+
 1. Image is properly tagged
 2. Image exists in the registry
 3. Kubernetes has imagePullSecrets configured (if using private registry)
@@ -152,6 +162,7 @@ If using a registry other than Docker Hub, ensure:
 ### Port Already in Use
 
 If port 3000 is already in use:
+
 ```bash
 # Find and kill process on port 3000
 # Windows:
@@ -166,6 +177,7 @@ lsof -i :3000 | grep LISTEN | awk '{print $2}' | xargs kill -9
 If you see: `unable to load in-cluster configuration, KUBERNETES_SERVICE_HOST and KUBERNETES_SERVICE_PORT must be defined`
 
 This means:
+
 1. The backend pod is not running in the Kubernetes cluster
 2. Or the ServiceAccount is not properly configured
 3. Or the pod is running in a different namespace

@@ -14,7 +14,7 @@ The trading platform backend has been migrated from Docker to Kubernetes orchest
 
 - Kubernetes cluster running (v1.27+)
 - `kubectl` configured to access your cluster
-- Backend service running outside the cluster with access to a kubeconfig file
+- Backend service can run inside the cluster using its ServiceAccount; local runs still use kubeconfig as a fallback
 
 ## Deployment Steps
 
@@ -27,6 +27,7 @@ kubectl apply -f infrastructure/k8s-namespace.yaml
 ```
 
 This creates:
+
 - `trading-sandbox` namespace
 - `trading-backend` ServiceAccount
 - `trading-backend-executor` Role with permissions to:
@@ -36,14 +37,15 @@ This creates:
 
 ### 2. Deploy Backend Service
 
-Run the backend as a local process or on a separate machine with kubeconfig access:
+Deploy the backend into the cluster so it can use in-cluster authentication:
 
 ```bash
 kubectl apply -f infrastructure/backend-deployment.yaml
 ```
 
-The backend process should have:
-- `KUBECONFIG` pointing to a valid kubeconfig, or `~/.kube/config` available
+The backend pod should have:
+
+- The `trading-backend` ServiceAccount
 - Access to the `trading-sandbox` namespace
 - Port `3000` exposed for the API server if needed
 
@@ -69,7 +71,7 @@ kubectl get rolebinding -n trading-sandbox
 
 1. **Submission**: Frontend sends code via `/api/submit` → Backend receives on `:3000`
 2. **Pod Creation**: Backend uses kubeconfig to authenticate to Kubernetes API
-3. **Pod Lifecycle**: 
+3. **Pod Lifecycle**:
    - Pod created with language-specific image (gcc, golang, rust, python)
    - Source code mounted as read-only HostPath volume at `/app`
    - Container executes code
@@ -89,6 +91,7 @@ kubectl get rolebinding -n trading-sandbox
 ### Backend can't create pods
 
 Check:
+
 1. ServiceAccount has correct permissions: `kubectl describe role trading-backend-executor -n trading-sandbox`
 2. Backend pod is using the ServiceAccount: Check pod manifest
 3. Verify RBAC RoleBinding: `kubectl get rolebinding -n trading-sandbox`
@@ -96,11 +99,13 @@ Check:
 ### Pods not starting
 
 Check logs:
+
 ```bash
 kubectl logs -n trading-sandbox <pod-name>
 ```
 
 Describe pod for events:
+
 ```bash
 kubectl describe pod -n trading-sandbox <pod-name>
 ```
@@ -108,6 +113,7 @@ kubectl describe pod -n trading-sandbox <pod-name>
 ### Image pull failures
 
 Ensure image registry is accessible from cluster nodes:
+
 ```bash
 kubectl get nodes
 # Run on node: docker pull gcc:latest (or specific image)
@@ -116,6 +122,7 @@ kubectl get nodes
 ## Environment Variables
 
 When running backend locally or on a separate host, ensure:
+
 - `KUBECONFIG` is set, or `~/.kube/config` exists on that host
 - Backend has network connectivity to the Kubernetes API server
 

@@ -30,10 +30,22 @@ type ExecutionResult struct {
 	ServiceName string `json:"service_name"`
 	Phase       string `json:"phase"`
 	Output      string `json:"output"`
+	NodePort    int32  `json:"node_port"`
+}
+
+// InCluster reports whether the backend is running inside a Kubernetes cluster.
+func InCluster() bool {
+	_, err := rest.InClusterConfig()
+	return err == nil
 }
 
 func getKubernetesConfig() (*rest.Config, error) {
-	// Use kubeconfig only; the backend is run outside the cluster.
+	if config, err := rest.InClusterConfig(); err == nil {
+		fmt.Println("Using in-cluster Kubernetes config")
+		return config, nil
+	}
+
+	// Fall back to kubeconfig when running the backend locally.
 	kubeconfig := os.Getenv("KUBECONFIG")
 	if kubeconfig == "" {
 		home, err := os.UserHomeDir()
@@ -84,8 +96,16 @@ func ExecuteCode(filePath string, language string, port int) (ExecutionResult, e
 		return ExecutionResult{}, err
 	}
 
-	phase, waitErr := waitForPodCompletion(ctx, clientset, "trading-sandbox", podID, 45*time.Second)
+	// Wait for the pod to be Ready (engine compiled and listening) instead of
+	// waiting for it to terminate.  Trading engines are long-running servers
+	// and will never reach the Succeeded phase on their own.
+	phase, waitErr := waitForPodReady(ctx, clientset, "trading-sandbox", podID, 60*time.Second)
+
+	// Collect whatever logs are available (startup output, compilation errors).
 	output, logErr := getPodLogs(ctx, clientset, "trading-sandbox", podID)
+
+	// Retrieve the NodePort so callers can reach the engine.
+	nodePort, npErr := getServiceNodePort(ctx, clientset, "trading-sandbox", serviceName)
 
 	if waitErr != nil {
 		if logErr == nil && strings.TrimSpace(output) != "" {
@@ -95,15 +115,22 @@ func ExecuteCode(filePath string, language string, port int) (ExecutionResult, e
 		} else {
 			output = "wait_error: " + waitErr.Error()
 		}
-		phase = "Unknown"
+		if phase == "" {
+			phase = "Unknown"
+		}
 	}
 
-	fmt.Printf("Kubernetes pod started successfully with ID: %s\n", podID)
+	if npErr != nil {
+		fmt.Printf("Warning: could not retrieve NodePort for %s: %v\n", serviceName, npErr)
+	}
+
+	fmt.Printf("Kubernetes pod %s — phase: %s, NodePort: %d\n", podID, phase, nodePort)
 	return ExecutionResult{
 		PodID:       podID,
 		ServiceName: serviceName,
 		Phase:       phase,
 		Output:      strings.TrimSpace(output),
+		NodePort:    nodePort,
 	}, nil
 }
 
@@ -114,6 +141,7 @@ func createSandboxPod(ctx context.Context, clientset *kubernetes.Clientset, file
 	configMapName := podName + "-code"
 	labels := map[string]string{
 		"app":  "trading-sandbox",
+		"pod":  podName,
 		"port": strconv.Itoa(port),
 	}
 
@@ -151,6 +179,21 @@ func createSandboxPod(ctx context.Context, clientset *kubernetes.Clientset, file
 							Protocol:      corev1.ProtocolTCP,
 						},
 					},
+					// TCP readiness probe: the pod is considered Ready only
+					// after the engine has compiled and started listening on
+					// the configured port.
+					ReadinessProbe: &corev1.Probe{
+						ProbeHandler: corev1.ProbeHandler{
+							TCPSocket: &corev1.TCPSocketAction{
+								Port: intstr.FromInt(port),
+							},
+						},
+						InitialDelaySeconds: 3,
+						PeriodSeconds:       2,
+						TimeoutSeconds:      1,
+						FailureThreshold:    25,
+						SuccessThreshold:    1,
+					},
 					VolumeMounts: []corev1.VolumeMount{
 						{
 							Name:      "code",
@@ -185,13 +228,16 @@ func createSandboxPod(ctx context.Context, clientset *kubernetes.Clientset, file
 			Namespace: namespace,
 		},
 		Spec: corev1.ServiceSpec{
+			// Select the specific sandbox pod so different sandboxes don't
+			// all become endpoints for every service.
 			Selector: map[string]string{
 				"app": "trading-sandbox",
+				"pod": podName,
 			},
 			Ports: []corev1.ServicePort{
 				{
 					Port:       int32(port),
-					TargetPort: intstr.FromInt(int(port)),
+					TargetPort: intstr.FromInt(port),
 					Protocol:   corev1.ProtocolTCP,
 				},
 			},
@@ -209,7 +255,11 @@ func createSandboxPod(ctx context.Context, clientset *kubernetes.Clientset, file
 	return createdPod.Name, serviceName, nil
 }
 
-func waitForPodCompletion(ctx context.Context, clientset *kubernetes.Clientset, namespace string, podName string, timeout time.Duration) (string, error) {
+// waitForPodReady polls the pod status until it reaches the Running phase with
+// a Ready condition (meaning the readiness probe has passed and the engine is
+// actively listening on its port).  If the pod enters the Failed phase the
+// function returns immediately with an error.
+func waitForPodReady(ctx context.Context, clientset *kubernetes.Clientset, namespace string, podName string, timeout time.Duration) (string, error) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		pod, err := clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
@@ -218,14 +268,37 @@ func waitForPodCompletion(ctx context.Context, clientset *kubernetes.Clientset, 
 		}
 
 		switch pod.Status.Phase {
-		case corev1.PodSucceeded, corev1.PodFailed:
-			return string(pod.Status.Phase), nil
+		case corev1.PodFailed:
+			return "Failed", fmt.Errorf("pod entered Failed phase")
+		case corev1.PodSucceeded:
+			// Unexpected for a long-running server, but handle gracefully.
+			return "Succeeded", nil
+		case corev1.PodRunning:
+			for _, cond := range pod.Status.Conditions {
+				if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+					return "Running", nil
+				}
+			}
 		}
 
-		time.Sleep(1 * time.Second)
+		time.Sleep(2 * time.Second)
 	}
 
-	return "Running", fmt.Errorf("timed out waiting for pod completion after %s", timeout)
+	return "Pending", fmt.Errorf("timed out waiting for pod to become ready after %s", timeout)
+}
+
+// getServiceNodePort fetches the NodePort allocated by Kubernetes for a service.
+func getServiceNodePort(ctx context.Context, clientset *kubernetes.Clientset, namespace, serviceName string) (int32, error) {
+	svc, err := clientset.CoreV1().Services(namespace).Get(ctx, serviceName, metav1.GetOptions{})
+	if err != nil {
+		return 0, fmt.Errorf("failed to get service %s: %v", serviceName, err)
+	}
+	for _, p := range svc.Spec.Ports {
+		if p.NodePort > 0 {
+			return p.NodePort, nil
+		}
+	}
+	return 0, fmt.Errorf("no NodePort found on service %s", serviceName)
 }
 
 func getPodLogs(ctx context.Context, clientset *kubernetes.Clientset, namespace string, podName string) (string, error) {
@@ -242,6 +315,42 @@ func getPodLogs(ctx context.Context, clientset *kubernetes.Clientset, namespace 
 	}
 
 	return string(content), nil
+}
+
+// CleanupSandbox deletes the pod, service, and configmap created for a sandbox
+// identified by podID.  Best-effort: collects all errors rather than failing
+// on the first one.
+func CleanupSandbox(podID string) error {
+	ctx := context.Background()
+	config, err := getKubernetesConfig()
+	if err != nil {
+		return fmt.Errorf("failed to get kubernetes config: %v", err)
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return fmt.Errorf("failed to create kubernetes client: %v", err)
+	}
+
+	namespace := "trading-sandbox"
+	serviceName := podID + "-svc"
+	configMapName := podID + "-code"
+
+	var errs []string
+
+	if err := clientset.CoreV1().Pods(namespace).Delete(ctx, podID, metav1.DeleteOptions{}); err != nil {
+		errs = append(errs, fmt.Sprintf("pod: %v", err))
+	}
+	if err := clientset.CoreV1().Services(namespace).Delete(ctx, serviceName, metav1.DeleteOptions{}); err != nil {
+		errs = append(errs, fmt.Sprintf("service: %v", err))
+	}
+	if err := clientset.CoreV1().ConfigMaps(namespace).Delete(ctx, configMapName, metav1.DeleteOptions{}); err != nil {
+		errs = append(errs, fmt.Sprintf("configmap: %v", err))
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("cleanup errors: %s", strings.Join(errs, "; "))
+	}
+	return nil
 }
 
 func buildSandboxSpec(absPath string, language string, port int) (sandboxSpec, error) {

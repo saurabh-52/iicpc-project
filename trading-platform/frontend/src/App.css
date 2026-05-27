@@ -366,7 +366,7 @@ select:focus-visible {
 
 .field-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 1rem;
 }
 
@@ -388,6 +388,54 @@ select:focus-visible {
 .feedback.error {
   background: rgba(239, 68, 68, 0.12);
   color: #b91c1c;
+}
+
+.result-panel {
+  display: grid;
+  gap: 0.9rem;
+  border-radius: 1rem;
+  padding: 1rem;
+  background: rgba(15, 23, 42, 0.04);
+  border: 1px solid rgba(148, 163, 184, 0.18);
+}
+
+.result-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.result-row span,
+.result-output > span {
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: #64748b;
+}
+
+.result-row strong {
+  color: var(--text-h);
+  font-size: 0.95rem;
+}
+
+.result-output {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.result-output pre {
+  margin: 0;
+  padding: 0.9rem 1rem;
+  border-radius: 0.9rem;
+  background: #0f172a;
+  color: #e2e8f0;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: 0.92rem/1.6 var(--mono);
 }
 
 .submit-button {
