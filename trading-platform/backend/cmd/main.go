@@ -37,6 +37,7 @@ type stressTestRequest struct {
 	Method        string `json:"method"`
 	Path          string `json:"path"`
 	ExpectReply   bool   `json:"expect_reply"`
+	RampUpSecs    int    `json:"ramp_up_seconds"`
 }
 
 func submissionNameForLanguage(language string) (string, error) {
@@ -282,16 +283,17 @@ func main() {
 		defer stressCancel()
 
 		metrics, err := botfleet.Run(stressCtx, botfleet.Config{
-			Target:      req.Target,
-			Protocol:    botfleet.NormalizeProtocol(req.Protocol),
-			Strategy:    botfleet.NormalizeStrategy(req.Strategy),
-			Bots:        req.Bots,
-			Requests:    req.Requests,
-			Duration:    duration,
-			Timeout:     timeout,
-			Method:      req.Method,
-			Path:        req.Path,
-			ExpectReply: req.ExpectReply,
+			Target:         req.Target,
+			Protocol:       botfleet.NormalizeProtocol(req.Protocol),
+			Strategy:       botfleet.NormalizeStrategy(req.Strategy),
+			Bots:           req.Bots,
+			Requests:       req.Requests,
+			Duration:       duration,
+			Timeout:        timeout,
+			Method:         req.Method,
+			Path:           req.Path,
+			ExpectReply:    req.ExpectReply,
+			RampUpDuration: time.Duration(req.RampUpSecs) * time.Second,
 		})
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "stress test failed", "error": err.Error()})

@@ -15,6 +15,7 @@ export default function SubmitPage() {
     language: 'cpp',
     protocol: 'http',
     strategy: 'bbo_heavy',
+    rampUpSeconds: '0',
     file: null
   });
   const [submitState, setSubmitState] = useState({ type: '', message: '' });
@@ -134,7 +135,8 @@ export default function SubmitPage() {
             timeout_ms: 2000,
             method: 'POST',
             path: '/',
-            expect_reply: formData.protocol === 'tcp',
+            expect_reply: formData.protocol === 'tcp' || formData.protocol === 'fix',
+            ramp_up_seconds: parseInt(formData.rampUpSeconds) || 0,
           }),
         });
 
@@ -246,6 +248,7 @@ export default function SubmitPage() {
               <select name="protocol" value={formData.protocol} onChange={handleChange}>
                 <option value="http">HTTP / REST</option>
                 <option value="tcp">Raw TCP</option>
+                <option value="fix">FIX Protocol</option>
               </select>
             </label>
           </div>
@@ -257,8 +260,18 @@ export default function SubmitPage() {
               <option value="flash_crash">Flash Crash (Volatility)</option>
               <option value="high_cancel">High Cancel Ratio (Spoofing)</option>
               <option value="wide_spread">Wide Spread (Memory Hog)</option>
+              <option value="market_maker">Market Maker (Two-Sided Quoting)</option>
+              <option value="iceberg">Iceberg (Hidden Orders)</option>
+              <option value="momentum_burst">Momentum Burst (Trending Market)</option>
             </select>
           </label>
+
+          <div className="field-grid">
+            <label className="field">
+              <span>Ramp-Up (seconds)</span>
+              <input type="number" name="rampUpSeconds" value={formData.rampUpSeconds} min="0" max="30" onChange={handleChange} />
+            </label>
+          </div>
 
           <label className="field upload-field">
             <span>Source Code</span>
@@ -339,6 +352,9 @@ export default function SubmitPage() {
               <div className="result-output">
                 <span>Latency summary</span>
                 <pre>
+                  {stressTestResult.min_latency_ms != null
+                    ? `min: ${stressTestResult.min_latency_ms.toFixed(2)}ms\n`
+                    : ''}
                   {stressTestResult.avg_latency_ms != null
                     ? `avg: ${stressTestResult.avg_latency_ms.toFixed(2)}ms\n`
                     : ''}
@@ -349,10 +365,27 @@ export default function SubmitPage() {
                     ? `p90: ${stressTestResult.p90_latency_ms.toFixed(2)}ms\n`
                     : ''}
                   {stressTestResult.p99_latency_ms != null
-                    ? `p99: ${stressTestResult.p99_latency_ms.toFixed(2)}ms`
+                    ? `p99: ${stressTestResult.p99_latency_ms.toFixed(2)}ms\n`
+                    : ''}
+                  {stressTestResult.max_latency_ms != null
+                    ? `max: ${stressTestResult.max_latency_ms.toFixed(2)}ms\n`
+                    : ''}
+                  {stressTestResult.stddev_latency_ms != null
+                    ? `σ:   ${stressTestResult.stddev_latency_ms.toFixed(2)}ms`
                     : ''}
                 </pre>
               </div>
+
+              {stressTestResult.error_breakdown && Object.keys(stressTestResult.error_breakdown).length > 0 ? (
+                <div className="result-output">
+                  <span>Error breakdown</span>
+                  <pre>
+                    {Object.entries(stressTestResult.error_breakdown)
+                      .map(([kind, count]) => `${kind}: ${count}`)
+                      .join('\n')}
+                  </pre>
+                </div>
+              ) : null}
             </section>
           ) : null}
 
