@@ -130,6 +130,7 @@ export default function SubmitPage() {
             target: sandboxExecution.target_url,
             protocol: formData.protocol,
             strategy: formData.strategy,
+            system_name: formData.systemName,
             bots: 16,
             requests: 48,
             timeout_ms: 2000,
@@ -155,10 +156,13 @@ export default function SubmitPage() {
           throw new Error(stressResult?.error || stressResult?.message || `Stress test failed with status ${stressResponse.status}`);
         }
 
-        setStressTestResult(stressResult?.metrics || null);
+        setStressTestResult(stressResult?.rounds?.[0]?.metrics || stressResult?.metrics || null);
+
+        const roundCount = stressResult?.rounds?.length || 1;
+        const strategies = (stressResult?.rounds || []).map(r => r.strategy).join(' + ');
         setSubmitState({
           type: 'success',
-          message: `${result?.message || 'Engine submitted successfully.'} Stress test launched with ${formData.strategy}.`,
+          message: `${result?.message || 'Engine submitted successfully.'} Stress test completed: ${roundCount} round(s) [${strategies || formData.strategy}].`,
         });
       } else if (sandboxExecution) {
         setSubmitState({
@@ -256,7 +260,7 @@ export default function SubmitPage() {
           <label className="field">
             <span>Stress Test Strategy</span>
             <select name="strategy" value={formData.strategy} onChange={handleChange}>
-              <option value="bbo_heavy">BBO Heavy (High Liquidity)</option>
+              <option value="bbo_heavy">BBO Heavy (Default)</option>
               <option value="flash_crash">Flash Crash (Volatility)</option>
               <option value="high_cancel">High Cancel Ratio (Spoofing)</option>
               <option value="wide_spread">Wide Spread (Memory Hog)</option>

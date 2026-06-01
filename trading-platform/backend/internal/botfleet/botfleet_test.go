@@ -11,6 +11,11 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
+
+	"github.com/Saurabh-52/trading-platform/internal/telemetry"
 )
 
 func TestGenerateOrderStrategies(t *testing.T) {
@@ -326,4 +331,68 @@ func TestOrderToFIX(t *testing.T) {
 
 func randSource(seed int64) *rand.Rand {
 	return rand.New(rand.NewSource(seed))
+}
+
+func TestHTTPWithTelemetry(t *testing.T) {
+	// Use manual lifecycle so miniredis stays alive during async goroutine flush
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("miniredis.Run: %v", err)
+	}
+	defer mr.Close()
+	// MaxRetries=0 prevents retry storms from orphaned fire-and-forget goroutines
+	// that would otherwise exhaust macOS ephemeral ports.
+	redisClient := redis.NewClient(&redis.Options{
+		Addr:       mr.Addr(),
+		MaxRetries: 0,
+	})
+	defer redisClient.Close()
+
+	// Stub trading engine: always 200 OK
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		_ = r.Body.Close()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer server.Close()
+
+	const submissionID = "test-sub-telemetry-001"
+
+	// Use Requests mode with a small fixed count to avoid port exhaustion.
+	// The Run function's "else" branch waits for sent>=Requests then cancels,
+	// which may interrupt the last in-flight request.  Use 1 bot to serialize.
+	metrics, err := Run(context.Background(), Config{
+		Target:          server.URL,
+		Protocol:        ProtocolHTTP,
+		Strategy:        StrategyBBOHeavy,
+		Bots:            1,
+		Requests:        20,
+		Timeout:         2 * time.Second,
+		Method:          http.MethodPost,
+		TelemetryClient: redisClient,
+		SubmissionID:    submissionID,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	t.Logf("Successes=%d Failures=%d", metrics.Successes, metrics.Failures)
+
+	// Give the fire-and-forget goroutines time to flush to miniredis
+	time.Sleep(300 * time.Millisecond)
+
+	ctx := context.Background()
+	events, err := telemetry.ConsumeAllForSubmission(ctx, redisClient, submissionID)
+	if err != nil {
+		t.Fatalf("ConsumeAllForSubmission: %v", err)
+	}
+	if len(events) == 0 {
+		t.Fatalf("expected >0 telemetry events, got 0 (successes=%d)", metrics.Successes)
+	}
+	t.Logf("TelemetryEvents=%d", len(events))
+	for _, e := range events {
+		if e.SubmissionID != submissionID {
+			t.Errorf("wrong SubmissionID: %q", e.SubmissionID)
+		}
+	}
 }

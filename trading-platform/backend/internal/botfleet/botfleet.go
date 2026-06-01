@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"math/rand"
 	"net"
@@ -16,6 +17,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/redis/go-redis/v9"
+
+	"github.com/Saurabh-52/trading-platform/internal/telemetry"
 )
 
 type Protocol string
@@ -39,19 +44,36 @@ const (
 )
 
 type Config struct {
-	Target         string
-	Protocol       Protocol
-	Strategy       Strategy
-	Bots           int
-	Requests       int
-	Duration       time.Duration
-	Timeout        time.Duration
-	Method         string
-	Path           string
-	ExpectReply    bool
-	ContentType    string
-	Seed           int64
-	RampUpDuration time.Duration // Gradual ramp-up: bots are staggered over this period
+	Target          string
+	Protocol        Protocol
+	Strategy        Strategy
+	Bots            int
+	Requests        int
+	Duration        time.Duration
+	Timeout         time.Duration
+	Method          string
+	Path            string
+	ExpectReply     bool
+	ContentType     string
+	Seed            int64
+	RampUpDuration  time.Duration // Gradual ramp-up: bots are staggered over this period
+	TelemetryClient *redis.Client // optional — nil disables telemetry publishing
+	SubmissionID    string        // used to tag telemetry events
+}
+
+// publishAsync sends a TelemetryEvent to Redis in a fire-and-forget goroutine.
+// It uses a 100ms context so a slow Redis never stalls the hot path.
+func publishAsync(client *redis.Client, event telemetry.TelemetryEvent) {
+	if client == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		if err := telemetry.PublishEvent(ctx, client, event); err != nil {
+			log.Printf("CRITICAL: dropped telemetry event %s seq %d: %v", event.SubmissionID, event.Sequence, err)
+		}
+	}()
 }
 
 type Order struct {
@@ -139,7 +161,13 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 		cfg.ContentType = "application/json"
 	}
 	if cfg.Seed == 0 {
-		cfg.Seed = time.Now().UnixNano()
+		// Generate a fixed, deterministic seed based on the strategy name.
+		// This guarantees that the same strategy always produces the exact same sequence of orders.
+		var fixedSeed int64 = 0xdeadbeef
+		for _, c := range cfg.Strategy {
+			fixedSeed = fixedSeed*31 + int64(c)
+		}
+		cfg.Seed = fixedSeed
 	}
 
 	start := time.Now()
@@ -204,7 +232,16 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 }
 
 func runHTTPWorker(ctx context.Context, cfg Config, botID int, seq *int, rng *rand.Rand, rec *recorder, sent *int64) {
-	client := &http.Client{Timeout: cfg.Timeout}
+	transport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+	}
+	defer transport.CloseIdleConnections()
+	httpClient := &http.Client{
+		Timeout:   cfg.Timeout,
+		Transport: transport,
+	}
 	for {
 		if !claimWork(ctx, cfg, sent) {
 			return
@@ -222,18 +259,44 @@ func runHTTPWorker(ctx context.Context, cfg Config, botID int, seq *int, rng *ra
 		req.Header.Set("X-Strategy", string(cfg.Strategy))
 
 		started := time.Now()
-		resp, err := client.Do(req)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			errKind := classifyError(err)
 			rec.addError(time.Since(started), errKind)
 			continue
 		}
-		_, _ = ioCopyAndClose(resp.Body)
+		latency := time.Since(started)
+
+		// Read up to 512 bytes of response body for telemetry.
+		var bodyBuf [512]byte
+		n, _ := resp.Body.Read(bodyBuf[:])
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		engineOut := string(bodyBuf[:n])
+
 		if resp.StatusCode >= 400 {
-			rec.addError(time.Since(started), fmt.Sprintf("http_%d", resp.StatusCode))
+			rec.addError(latency, fmt.Sprintf("http_%d", resp.StatusCode))
 		} else {
-			rec.add(time.Since(started), true)
+			rec.add(latency, true)
 		}
+
+		action := order.Action
+		if action == "" {
+			action = "NEW"
+		}
+		publishAsync(cfg.TelemetryClient, telemetry.TelemetryEvent{
+			SubmissionID: cfg.SubmissionID,
+			BotID:        botID,
+			Sequence:     *seq,
+			Action:       action,
+			Side:         order.Side,
+			Price:        order.Price,
+			Quantity:     order.Quantity,
+			StatusCode:   resp.StatusCode,
+			LatencyMs:    float64(latency.Nanoseconds()) / 1e6,
+			Timestamp:    time.Now().UTC(),
+			EngineOutput: engineOut,
+		})
 	}
 }
 
@@ -283,6 +346,23 @@ func runTCPWorker(ctx context.Context, cfg Config, botID int, seq *int, rng *ran
 		}
 
 		rec.add(time.Since(started), true)
+
+		action := order.Action
+		if action == "" {
+			action = "NEW"
+		}
+		publishAsync(cfg.TelemetryClient, telemetry.TelemetryEvent{
+			SubmissionID: cfg.SubmissionID,
+			BotID:        botID,
+			Sequence:     *seq,
+			Action:       action,
+			Side:         order.Side,
+			Price:        order.Price,
+			Quantity:     order.Quantity,
+			StatusCode:   200,
+			LatencyMs:    float64(time.Since(started).Nanoseconds()) / 1e6,
+			Timestamp:    time.Now().UTC(),
+		})
 	}
 }
 
@@ -335,6 +415,23 @@ func runFIXWorker(ctx context.Context, cfg Config, botID int, seq *int, rng *ran
 		}
 
 		rec.add(time.Since(started), true)
+
+		action := order.Action
+		if action == "" {
+			action = "NEW"
+		}
+		publishAsync(cfg.TelemetryClient, telemetry.TelemetryEvent{
+			SubmissionID: cfg.SubmissionID,
+			BotID:        botID,
+			Sequence:     *seq,
+			Action:       action,
+			Side:         order.Side,
+			Price:        order.Price,
+			Quantity:     order.Quantity,
+			StatusCode:   200,
+			LatencyMs:    float64(time.Since(started).Nanoseconds()) / 1e6,
+			Timestamp:    time.Now().UTC(),
+		})
 	}
 }
 

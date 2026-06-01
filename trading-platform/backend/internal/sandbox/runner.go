@@ -64,8 +64,7 @@ func getKubernetesConfig() (*rest.Config, error) {
 	return config, nil
 }
 
-func ExecuteCode(filePath string, language string, port int) (ExecutionResult, error) {
-	ctx := context.Background()
+func ExecuteCode(ctx context.Context, filePath string, language string, port int) (ExecutionResult, error) {
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
 		return ExecutionResult{}, fmt.Errorf("failed to get absolute path: %v", err)
@@ -139,6 +138,12 @@ func createSandboxPod(ctx context.Context, clientset *kubernetes.Clientset, file
 	podName := fmt.Sprintf("sandbox-%d-%d", port, time.Now().Unix())
 	serviceName := podName + "-svc"
 	configMapName := podName + "-code"
+
+	// Auto-cleanup: remove all existing sandbox pods/services/configmaps so the
+	// new LoadBalancer service can bind to localhost:containerPort without conflict.
+	// On macOS with minikube (Docker driver), all LoadBalancer services sharing
+	// the same containerPort compete for the same localhost binding.
+	cleanupOldSandboxes(ctx, clientset, namespace)
 	labels := map[string]string{
 		"app":  "trading-sandbox",
 		"pod":  podName,
@@ -241,7 +246,7 @@ func createSandboxPod(ctx context.Context, clientset *kubernetes.Clientset, file
 					Protocol:   corev1.ProtocolTCP,
 				},
 			},
-			Type: corev1.ServiceTypeNodePort,
+			Type: corev1.ServiceTypeLoadBalancer,
 		},
 	}
 
@@ -315,6 +320,46 @@ func getPodLogs(ctx context.Context, clientset *kubernetes.Clientset, namespace 
 	}
 
 	return string(content), nil
+}
+
+// cleanupOldSandboxes removes all existing sandbox pods, services, and configmaps
+// in the namespace.  Best-effort: errors are logged but don't block new sandbox creation.
+func cleanupOldSandboxes(ctx context.Context, clientset *kubernetes.Clientset, namespace string) {
+	// Delete all pods with the sandbox label
+	podList, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: "app=trading-sandbox",
+	})
+	if err == nil {
+		for _, pod := range podList.Items {
+			_ = clientset.CoreV1().Pods(namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
+			fmt.Printf("Auto-cleanup: deleted old pod %s\n", pod.Name)
+		}
+	}
+
+	// Delete all services (except kubernetes system services)
+	svcList, err := clientset.CoreV1().Services(namespace).List(ctx, metav1.ListOptions{})
+	if err == nil {
+		for _, svc := range svcList.Items {
+			if strings.HasPrefix(svc.Name, "sandbox-") {
+				_ = clientset.CoreV1().Services(namespace).Delete(ctx, svc.Name, metav1.DeleteOptions{})
+				fmt.Printf("Auto-cleanup: deleted old service %s\n", svc.Name)
+			}
+		}
+	}
+
+	// Delete all sandbox configmaps
+	cmList, err := clientset.CoreV1().ConfigMaps(namespace).List(ctx, metav1.ListOptions{})
+	if err == nil {
+		for _, cm := range cmList.Items {
+			if strings.HasPrefix(cm.Name, "sandbox-") {
+				_ = clientset.CoreV1().ConfigMaps(namespace).Delete(ctx, cm.Name, metav1.DeleteOptions{})
+				fmt.Printf("Auto-cleanup: deleted old configmap %s\n", cm.Name)
+			}
+		}
+	}
+
+	// Give K8s a moment to release resources
+	time.Sleep(1 * time.Second)
 }
 
 // CleanupSandbox deletes the pod, service, and configmap created for a sandbox

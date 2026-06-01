@@ -2,10 +2,10 @@ import { BrowserRouter as Router, Routes, Route, Link, useLocation } from 'react
 import './App.css';
 import SubmitPage from './pages/SubmitPage';
 import Dashboard from './pages/Dashboard';
+import Leaderboard from './pages/Leaderboard';
 
 function Shell() {
   const location = useLocation();
-  const isSubmitPage = location.pathname === '/submit';
 
   return (
     <div className="app-shell">
@@ -19,10 +19,13 @@ function Shell() {
         </div>
 
         <nav className="nav-actions" aria-label="Primary navigation">
-          <Link className={isSubmitPage ? 'nav-link' : 'nav-link active'} to="/">
+          <Link className={`nav-link ${location.pathname === '/' ? 'active' : ''}`} to="/">
             Dashboard
           </Link>
-          <Link className={isSubmitPage ? 'nav-link active' : 'nav-link'} to="/submit">
+          <Link className={`nav-link ${location.pathname === '/leaderboard' ? 'active' : ''}`} to="/leaderboard">
+            Leaderboard
+          </Link>
+          <Link className={`nav-link ${location.pathname === '/submit' ? 'active' : ''}`} to="/submit">
             Submit engine
           </Link>
         </nav>
@@ -31,6 +34,7 @@ function Shell() {
       <main className="page-frame">
         <Routes>
           <Route path="/" element={<Dashboard />} />
+          <Route path="/leaderboard" element={<Leaderboard />} />
           <Route path="/submit" element={<SubmitPage />} />
         </Routes>
       </main>
