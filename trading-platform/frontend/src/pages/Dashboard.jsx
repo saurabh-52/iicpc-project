@@ -1,19 +1,42 @@
+import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 
-const stats = [
-  { label: 'Active engines', value: '12' },
-  { label: 'Runs today', value: '84' },
-  { label: 'Avg. latency', value: '1.8ms' },
-  { label: 'Sandbox status', value: 'Ready' },
-];
-
-const timeline = [
-  'Latest binary upload passed validation',
-  'Stress test queue is clear for new submissions',
-  'Sandbox workers are healthy and available',
-];
-
 export default function Dashboard() {
+  const [stats, setStats] = useState({
+    activeEngines: '—',
+    totalSubmissions: '—',
+    topScore: '—',
+    topGrade: '—',
+  });
+  const [topEntries, setTopEntries] = useState([]);
+
+  useEffect(() => {
+    fetch('/api/leaderboard?limit=5')
+      .then(res => res.ok ? res.json() : Promise.reject())
+      .then(data => {
+        const lb = data.leaderboard || [];
+        setTopEntries(lb);
+        if (lb.length > 0) {
+          setStats({
+            activeEngines: String(lb.length),
+            totalSubmissions: String(lb.length),
+            topScore: lb[0].total_score.toFixed(1),
+            topGrade: lb[0].grade,
+          });
+        }
+      })
+      .catch(() => {
+        // Backend unavailable — keep defaults
+      });
+  }, []);
+
+  const statCards = [
+    { label: 'Submissions', value: stats.totalSubmissions },
+    { label: 'Top score', value: stats.topScore },
+    { label: 'Best grade', value: stats.topGrade },
+    { label: 'Sandbox status', value: 'Ready' },
+  ];
+
   return (
     <section className="dashboard-grid">
       <article className="hero-card panel">
@@ -29,9 +52,9 @@ export default function Dashboard() {
             <Link className="button button-primary" to="/submit">
               Submit an engine
             </Link>
-            <a className="button button-secondary" href="#overview">
-              View overview
-            </a>
+            <Link className="button button-secondary" to="/leaderboard">
+              View leaderboard
+            </Link>
           </div>
         </div>
 
@@ -45,7 +68,7 @@ export default function Dashboard() {
       </article>
 
       <section className="stats-grid" id="overview" aria-label="System overview metrics">
-        {stats.map((stat) => (
+        {statCards.map((stat) => (
           <article key={stat.label} className="stat-card panel">
             <span>{stat.label}</span>
             <strong>{stat.value}</strong>
@@ -57,18 +80,32 @@ export default function Dashboard() {
         <div className="section-header">
           <div>
             <span className="section-tag">Recent activity</span>
-            <h3>Operational notes</h3>
+            <h3>Latest submissions</h3>
           </div>
-          <span className="subtle-chip">Live</span>
+          <Link to="/leaderboard" className="subtle-chip" style={{ textDecoration: 'none' }}>
+            View all →
+          </Link>
         </div>
 
         <div className="timeline-list">
-          {timeline.map((item) => (
-            <div key={item} className="timeline-item">
+          {topEntries.length === 0 ? (
+            <div className="timeline-item">
               <span className="timeline-dot" />
-              <p>{item}</p>
+              <p>No submissions yet. Submit a trading engine to get started.</p>
             </div>
-          ))}
+          ) : (
+            topEntries.map((entry) => (
+              <div key={entry.submission_id} className="timeline-item">
+                <span className="timeline-dot" />
+                <p>
+                  <strong>{entry.grade}</strong> — Score {entry.total_score.toFixed(1)} —{' '}
+                  <span style={{ fontFamily: 'var(--mono)', fontSize: '0.85em', color: '#64748b' }}>
+                    {entry.submission_id.slice(0, 24)}
+                  </span>
+                </p>
+              </div>
+            ))
+          )}
         </div>
       </section>
     </section>
