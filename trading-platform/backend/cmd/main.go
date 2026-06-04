@@ -3,9 +3,11 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -48,19 +50,55 @@ type stressTestRequest struct {
 	RampUpSecs    int    `json:"ramp_up_seconds"`
 }
 
-func submissionNameForLanguage(language string) (string, error) {
+func extensionForLanguage(language string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(language)) {
 	case "cpp", "c++", "cc", "cxx":
-		return "main.cpp", nil
+		return ".cpp", nil
 	case "go":
-		return "main.go", nil
+		return ".go", nil
 	case "rust":
-		return "main.rs", nil
+		return ".rs", nil
 	case "python", "py":
-		return "main.py", nil
+		return ".py", nil
 	default:
 		return "", fmt.Errorf("unsupported language: %s", language)
 	}
+}
+
+func sanitizeDNSName(s string) string {
+	var sb strings.Builder
+	for _, r := range s {
+		isAlphaNum := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+		if isAlphaNum {
+			sb.WriteRune(r)
+		} else if r == '-' {
+			if sb.Len() > 0 {
+				sb.WriteRune(r)
+			}
+		}
+	}
+	res := sb.String()
+	for len(res) > 0 && res[len(res)-1] == '-' {
+		res = res[:len(res)-1]
+	}
+	if len(res) > 50 {
+		res = res[:50]
+	}
+	return strings.ToLower(res)
+}
+
+func randomString(n int) string {
+	const letters = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, n)
+	for i := range b {
+		num, err := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
+		if err != nil {
+			b[i] = letters[0]
+		} else {
+			b[i] = letters[num.Int64()]
+		}
+	}
+	return string(b)
 }
 
 func extensionAllowedForLanguage(filename string, language string) bool {
@@ -89,7 +127,7 @@ func extensionAllowedForLanguage(filename string, language string) bool {
 
 // buildTargetURL constructs the URL the bot fleet should use to reach the
 // sandbox engine.  When running in-cluster the service DNS name is used;
-// when running locally it retrieves the minikube IP or falls back to 127.0.0.1.
+// when running locally it retrieves the minikube IP or falls back to 127.0.0.1 and uses NodePort.
 func buildTargetURL(result sandbox.ExecutionResult, protocol string, containerPort int) string {
 	proto := strings.ToLower(strings.TrimSpace(protocol))
 
@@ -101,19 +139,35 @@ func buildTargetURL(result sandbox.ExecutionResult, protocol string, containerPo
 		return fmt.Sprintf("http://%s:%d", host, containerPort)
 	}
 
-	// Running locally on macOS with minikube (Docker driver) + minikube tunnel.
-	// LoadBalancer services are mapped to 127.0.0.1:<containerPort> by the tunnel.
-	// The sandbox runner auto-cleans old services so there's only one active
-	// LoadBalancer per containerPort, avoiding port collisions.
+	// Running locally outside cluster: try to get minikube IP, fallback to 127.0.0.1.
+	// Use NodePort if available to support parallel executions, fallback to containerPort.
 	hostIP := "127.0.0.1"
+	if minikubeIP := os.Getenv("MINIKUBE_IP"); minikubeIP != "" {
+		hostIP = minikubeIP
+	}
+
+	portToUse := containerPort
+	if result.NodePort > 0 {
+		portToUse = int(result.NodePort)
+	}
 
 	if proto == "tcp" {
-		return fmt.Sprintf("%s:%d", hostIP, containerPort)
+		return fmt.Sprintf("%s:%d", hostIP, portToUse)
 	}
-	return fmt.Sprintf("http://%s:%d", hostIP, containerPort)
+	return fmt.Sprintf("http://%s:%d", hostIP, portToUse)
 }
 
 func main() {
+	// Clean up any leftover sandboxes on server startup
+	go func() {
+		log.Println("Starting global cleanup of old sandboxes...")
+		if err := sandbox.CleanupAllSandboxes(context.Background()); err != nil {
+			log.Printf("Startup cleanup warning: %v", err)
+		} else {
+			log.Println("Global cleanup of old sandboxes completed successfully")
+		}
+	}()
+
 	app := fiber.New()
 
 	// Enable CORS for frontend communication
@@ -223,6 +277,11 @@ func main() {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "source_code file is required"})
 		}
 
+		systemName := strings.TrimSpace(c.FormValue("systemName", ""))
+		if systemName == "" {
+			systemName = "default"
+		}
+
 		language := c.FormValue("language", "cpp")
 		protocol := strings.ToLower(strings.TrimSpace(c.FormValue("protocol", "http")))
 		portValue := strings.TrimSpace(c.FormValue("port", ""))
@@ -235,7 +294,7 @@ func main() {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "port must be a valid TCP port"})
 		}
 
-		submissionName, err := submissionNameForLanguage(language)
+		ext, err := extensionForLanguage(language)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": err.Error()})
 		}
@@ -244,10 +303,18 @@ func main() {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": fmt.Sprintf("file extension %s does not match selected language %s", filepath.Ext(file.Filename), language)})
 		}
 
+		sanitizedSystem := sanitizeDNSName(systemName)
+		if sanitizedSystem == "" {
+			sanitizedSystem = "default"
+		}
+		submissionName := fmt.Sprintf("%s-%d-%s%s", sanitizedSystem, time.Now().UnixNano(), randomString(4), ext)
+
 		filePath := filepath.Join("./workspace", submissionName)
 		if err := c.SaveFile(file, filePath); err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "failed to save uploaded file"})
 		}
+		// Ensure host disk cleanup once this request returns
+		defer os.Remove(filePath)
 
 		fmt.Println("Attempting to start sandbox for:", filePath)
 
@@ -266,7 +333,7 @@ func main() {
 					resultCh <- sandboxOutcome{err: fmt.Errorf("sandbox panic: %v", r)}
 				}
 			}()
-			result, err := sandbox.ExecuteCode(ctx, filePath, language, port)
+			result, err := sandbox.ExecuteCode(ctx, filePath, language, port, systemName)
 			resultCh <- sandboxOutcome{result: result, err: err}
 		}()
 
@@ -481,6 +548,209 @@ func main() {
 			})
 		}
 		return c.JSON(fiber.Map{"message": "sandbox cleaned up", "pod_id": podID})
+	})
+
+	// Contest listing route
+	app.Get("/contests", func(c *fiber.Ctx) error {
+		if db == nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"message": "database not available"})
+		}
+		contests, err := db.GetContests(c.Context())
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "failed to query contests", "error": err.Error()})
+		}
+		return c.JSON(fiber.Map{"contests": contests})
+	})
+
+	// Contest registration route
+	app.Post("/contests/:id/register", func(c *fiber.Ctx) error {
+		if db == nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"message": "database not available"})
+		}
+		contestID := c.Params("id")
+		if strings.TrimSpace(contestID) == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "contest ID is required"})
+		}
+
+		var payload struct {
+			SystemName string `json:"systemName"`
+			Code       string `json:"code"`
+		}
+		if err := c.BodyParser(&payload); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "invalid registration payload", "error": err.Error()})
+		}
+
+		if strings.TrimSpace(payload.SystemName) == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "systemName is required"})
+		}
+
+		err := db.RegisterSystemForContest(c.Context(), contestID, payload.SystemName, payload.Code)
+		if err != nil {
+			status := fiber.StatusInternalServerError
+			if strings.Contains(err.Error(), "contest not found") {
+				status = fiber.StatusNotFound
+			} else if strings.Contains(err.Error(), "invalid contest code") || strings.Contains(err.Error(), "code is required") {
+				status = fiber.StatusBadRequest
+			}
+			return c.Status(status).JSON(fiber.Map{"message": "registration failed", "error": err.Error()})
+		}
+
+		return c.JSON(fiber.Map{
+			"message": "Registered successfully",
+			"contest_id": contestID,
+			"system_name": payload.SystemName,
+		})
+	})
+
+	// Contest Draft saving route
+	app.Post("/contests/draft", func(c *fiber.Ctx) error {
+		if db == nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"message": "database not available"})
+		}
+		var payload struct {
+			Details  json.RawMessage `json:"details"`
+			Problems json.RawMessage `json:"problems"`
+		}
+		if err := c.BodyParser(&payload); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "invalid draft payload", "error": err.Error()})
+		}
+		if err := db.SaveContestDraft(c.Context(), payload.Details, payload.Problems); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "failed to save draft", "error": err.Error()})
+		}
+		return c.JSON(fiber.Map{"message": "Draft saved successfully"})
+	})
+
+	// Contest Publishing route
+	app.Post("/contests/publish", func(c *fiber.Ctx) error {
+		if db == nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"message": "database not available"})
+		}
+		var payload struct {
+			Details struct {
+				ID                   string `json:"id"`
+				Name                 string `json:"name"`
+				Description          string `json:"description"`
+				Visibility           string `json:"visibility"`
+				Code                 string `json:"code"`
+				StartTime            string `json:"startTime"`
+				DurationMinutes      int    `json:"durationMinutes"`
+				RegistrationDeadline string `json:"registrationDeadline"`
+			} `json:"details"`
+			Problems []struct {
+				ID                    string `json:"id"`
+				Code                  string `json:"code"`
+				Title                 string `json:"title"`
+				Statement             string `json:"statement"`
+				TimeLimit             int    `json:"timeLimit"`
+				MemoryLimit           int    `json:"memoryLimit"`
+				SampleStrategies      []string `json:"sampleStrategies"`
+				SampleBotFiles        []struct {
+					Name    string `json:"name"`
+					Content string `json:"content"`
+				} `json:"sampleBotFiles"`
+				SampleShowCustom      bool   `json:"sampleShowCustom"`
+				SampleTargetInjection string `json:"sampleTargetInjection"`
+				SampleProtocol        string `json:"sampleProtocol"`
+				SampleTelemetryFormat string `json:"sampleTelemetryFormat"`
+				HiddenStrategies      []string `json:"hiddenStrategies"`
+				HiddenBotFiles        []struct {
+					Name    string `json:"name"`
+					Content string `json:"content"`
+				} `json:"hiddenBotFiles"`
+				HiddenShowCustom      bool   `json:"hiddenShowCustom"`
+				HiddenTargetInjection string `json:"hiddenTargetInjection"`
+				HiddenProtocol        string `json:"hiddenProtocol"`
+				HiddenTelemetryFormat string `json:"hiddenTelemetryFormat"`
+			} `json:"problems"`
+		}
+
+		if err := c.BodyParser(&payload); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "invalid publish payload", "error": err.Error()})
+		}
+
+		if strings.TrimSpace(payload.Details.Name) == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "contest name is required"})
+		}
+		if strings.TrimSpace(payload.Details.StartTime) == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "start time is required"})
+		}
+		if payload.Details.Visibility == "private" && strings.TrimSpace(payload.Details.Code) == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "contest code is required for private visibility"})
+		}
+
+		// Parse times (support RFC3339 and standard HTML datetime-local format)
+		startTime, err := time.Parse(time.RFC3339, payload.Details.StartTime)
+		if err != nil {
+			startTime, err = time.Parse("2006-01-02T15:04", payload.Details.StartTime)
+			if err != nil {
+				// Fallback to location parsing
+				startTime, err = time.ParseInLocation("2006-01-02T15:04", payload.Details.StartTime, time.Local)
+				if err != nil {
+					return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "invalid startTime format", "error": err.Error()})
+				}
+			}
+		}
+
+		var regDeadline *time.Time
+		if strings.TrimSpace(payload.Details.RegistrationDeadline) != "" {
+			parsedDead, err := time.Parse(time.RFC3339, payload.Details.RegistrationDeadline)
+			if err != nil {
+				parsedDead, err = time.Parse("2006-01-02T15:04", payload.Details.RegistrationDeadline)
+				if err != nil {
+					parsedDead, err = time.ParseInLocation("2006-01-02T15:04", payload.Details.RegistrationDeadline, time.Local)
+				}
+			}
+			if err == nil {
+				regDeadline = &parsedDead
+			}
+		}
+
+		// Convert problems to store.ProblemData
+		var problemsData []store.ProblemData
+		for _, p := range payload.Problems {
+			sampleBotJSON, _ := json.Marshal(p.SampleBotFiles)
+			hiddenBotJSON, _ := json.Marshal(p.HiddenBotFiles)
+
+			problemsData = append(problemsData, store.ProblemData{
+				ID:                    p.ID,
+				Code:                  p.Code,
+				Title:                 p.Title,
+				Statement:             p.Statement,
+				TimeLimit:             p.TimeLimit,
+				MemoryLimit:           p.MemoryLimit,
+				SampleStrategies:      p.SampleStrategies,
+				SampleBotFilesJSON:    string(sampleBotJSON),
+				SampleShowCustom:      p.SampleShowCustom,
+				SampleTargetInjection: p.SampleTargetInjection,
+				SampleProtocol:        p.SampleProtocol,
+				SampleTelemetryFormat: p.SampleTelemetryFormat,
+				HiddenStrategies:      p.HiddenStrategies,
+				HiddenBotFilesJSON:    string(hiddenBotJSON),
+				HiddenShowCustom:      p.HiddenShowCustom,
+				HiddenTargetInjection: p.HiddenTargetInjection,
+				HiddenProtocol:        p.HiddenProtocol,
+				HiddenTelemetryFormat: p.HiddenTelemetryFormat,
+			})
+		}
+
+		// Generate dynamic contest ID if not provided
+		contestID := payload.Details.ID
+		if strings.TrimSpace(contestID) == "" {
+			contestID = fmt.Sprintf("contest-%d-%s", time.Now().Unix(), randomString(4))
+		}
+
+		err = db.PublishContest(c.Context(), contestID,
+			payload.Details.Name, payload.Details.Description, payload.Details.Visibility, payload.Details.Code,
+			startTime, payload.Details.DurationMinutes, regDeadline, problemsData,
+		)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "failed to publish contest", "error": err.Error()})
+		}
+
+		return c.JSON(fiber.Map{
+			"message":    "Contest published successfully",
+			"contest_id": contestID,
+		})
 	})
 
 	log.Println("Platform API running on port 3000")

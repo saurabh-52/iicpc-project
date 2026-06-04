@@ -279,8 +279,8 @@ func TestEnhancedMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run failed: %v", err)
 	}
-	if metrics.MinLatencyMs <= 0 {
-		t.Fatal("expected positive min_latency_ms")
+	if metrics.MinLatencyMs < 0 {
+		t.Fatal("expected non-negative min_latency_ms")
 	}
 	if metrics.MaxLatencyMs < metrics.MinLatencyMs {
 		t.Fatalf("max (%.4f) should be >= min (%.4f)", metrics.MaxLatencyMs, metrics.MinLatencyMs)

@@ -3,6 +3,7 @@ import './App.css';
 import SubmitPage from './pages/SubmitPage';
 import Dashboard from './pages/Dashboard';
 import Leaderboard from './pages/Leaderboard';
+import ContestPage from './pages/ContestPage';
 
 function Shell() {
   const location = useLocation();
@@ -28,6 +29,9 @@ function Shell() {
           <Link className={`nav-link ${location.pathname === '/submit' ? 'active' : ''}`} to="/submit">
             Submit engine
           </Link>
+          <Link className={`nav-link ${location.pathname === '/contests' ? 'active' : ''}`} to="/contests">
+            Contests
+          </Link>
         </nav>
       </header>
 
@@ -36,6 +40,7 @@ function Shell() {
           <Route path="/" element={<Dashboard />} />
           <Route path="/leaderboard" element={<Leaderboard />} />
           <Route path="/submit" element={<SubmitPage />} />
+          <Route path="/contests" element={<ContestPage />} />
         </Routes>
       </main>
     </div>

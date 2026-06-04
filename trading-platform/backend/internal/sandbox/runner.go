@@ -3,8 +3,10 @@ package sandbox
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"io"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -64,7 +66,7 @@ func getKubernetesConfig() (*rest.Config, error) {
 	return config, nil
 }
 
-func ExecuteCode(ctx context.Context, filePath string, language string, port int) (ExecutionResult, error) {
+func ExecuteCode(ctx context.Context, filePath string, language string, port int, systemName string) (ExecutionResult, error) {
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
 		return ExecutionResult{}, fmt.Errorf("failed to get absolute path: %v", err)
@@ -90,7 +92,7 @@ func ExecuteCode(ctx context.Context, filePath string, language string, port int
 		return ExecutionResult{}, fmt.Errorf("failed to read source file: %v", err)
 	}
 
-	podID, serviceName, err := createSandboxPod(ctx, clientset, filepath.Base(absPath), string(sourceBytes), spec, port)
+	podID, serviceName, err := createSandboxPod(ctx, clientset, filepath.Base(absPath), string(sourceBytes), spec, port, systemName)
 	if err != nil {
 		return ExecutionResult{}, err
 	}
@@ -133,27 +135,31 @@ func ExecuteCode(ctx context.Context, filePath string, language string, port int
 	}, nil
 }
 
-func createSandboxPod(ctx context.Context, clientset *kubernetes.Clientset, fileName string, sourceCode string, spec sandboxSpec, port int) (string, string, error) {
+func createSandboxPod(ctx context.Context, clientset *kubernetes.Clientset, fileName string, sourceCode string, spec sandboxSpec, port int, systemName string) (string, string, error) {
 	namespace := "trading-sandbox"
-	podName := fmt.Sprintf("sandbox-%d-%d", port, time.Now().Unix())
+	sanitizedSystem := sanitizeDNSName(systemName)
+	if sanitizedSystem == "" {
+		sanitizedSystem = "default"
+	}
+	podName := fmt.Sprintf("sb-%s-%d-%s", sanitizedSystem, time.Now().Unix(), randomString(4))
 	serviceName := podName + "-svc"
 	configMapName := podName + "-code"
 
-	// Auto-cleanup: remove all existing sandbox pods/services/configmaps so the
-	// new LoadBalancer service can bind to localhost:containerPort without conflict.
-	// On macOS with minikube (Docker driver), all LoadBalancer services sharing
-	// the same containerPort compete for the same localhost binding.
-	cleanupOldSandboxes(ctx, clientset, namespace)
+	// Auto-cleanup: remove only the old sandbox pods/services/configmaps belonging to this systemName
+	cleanupUserSandboxes(ctx, clientset, namespace, systemName)
+
 	labels := map[string]string{
-		"app":  "trading-sandbox",
-		"pod":  podName,
-		"port": strconv.Itoa(port),
+		"app":         "trading-sandbox",
+		"pod":         podName,
+		"port":        strconv.Itoa(port),
+		"system-name": sanitizedSystem,
 	}
 
 	configMap := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      configMapName,
 			Namespace: namespace,
+			Labels:    labels,
 		},
 		Data: map[string]string{
 			fileName: sourceCode,
@@ -224,6 +230,7 @@ func createSandboxPod(ctx context.Context, clientset *kubernetes.Clientset, file
 
 	createdPod, err := clientset.CoreV1().Pods(namespace).Create(ctx, pod, metav1.CreateOptions{})
 	if err != nil {
+		_ = clientset.CoreV1().ConfigMaps(namespace).Delete(ctx, configMapName, metav1.DeleteOptions{})
 		return "", "", fmt.Errorf("failed to create pod: %v", err)
 	}
 
@@ -231,6 +238,7 @@ func createSandboxPod(ctx context.Context, clientset *kubernetes.Clientset, file
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      serviceName,
 			Namespace: namespace,
+			Labels:    labels,
 		},
 		Spec: corev1.ServiceSpec{
 			// Select the specific sandbox pod so different sandboxes don't
@@ -336,30 +344,130 @@ func cleanupOldSandboxes(ctx context.Context, clientset *kubernetes.Clientset, n
 		}
 	}
 
-	// Delete all services (except kubernetes system services)
-	svcList, err := clientset.CoreV1().Services(namespace).List(ctx, metav1.ListOptions{})
+	// Delete all services with the sandbox label
+	svcList, err := clientset.CoreV1().Services(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: "app=trading-sandbox",
+	})
 	if err == nil {
 		for _, svc := range svcList.Items {
-			if strings.HasPrefix(svc.Name, "sandbox-") {
-				_ = clientset.CoreV1().Services(namespace).Delete(ctx, svc.Name, metav1.DeleteOptions{})
-				fmt.Printf("Auto-cleanup: deleted old service %s\n", svc.Name)
-			}
+			_ = clientset.CoreV1().Services(namespace).Delete(ctx, svc.Name, metav1.DeleteOptions{})
+			fmt.Printf("Auto-cleanup: deleted old service %s\n", svc.Name)
 		}
 	}
 
 	// Delete all sandbox configmaps
-	cmList, err := clientset.CoreV1().ConfigMaps(namespace).List(ctx, metav1.ListOptions{})
+	cmList, err := clientset.CoreV1().ConfigMaps(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: "app=trading-sandbox",
+	})
 	if err == nil {
 		for _, cm := range cmList.Items {
-			if strings.HasPrefix(cm.Name, "sandbox-") {
-				_ = clientset.CoreV1().ConfigMaps(namespace).Delete(ctx, cm.Name, metav1.DeleteOptions{})
-				fmt.Printf("Auto-cleanup: deleted old configmap %s\n", cm.Name)
-			}
+			_ = clientset.CoreV1().ConfigMaps(namespace).Delete(ctx, cm.Name, metav1.DeleteOptions{})
+			fmt.Printf("Auto-cleanup: deleted old configmap %s\n", cm.Name)
 		}
 	}
 
 	// Give K8s a moment to release resources
 	time.Sleep(1 * time.Second)
+}
+
+// CleanupAllSandboxes deletes all sandbox pods, services, and configmaps.
+// It is intended to run once at backend server startup.
+func CleanupAllSandboxes(ctx context.Context) error {
+	config, err := getKubernetesConfig()
+	if err != nil {
+		return fmt.Errorf("failed to get kubernetes config: %v", err)
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return fmt.Errorf("failed to create kubernetes client: %v", err)
+	}
+	cleanupOldSandboxes(ctx, clientset, "trading-sandbox")
+	return nil
+}
+
+// cleanupUserSandboxes removes existing sandbox pods, services, and configmaps
+// that match the given system name.
+func cleanupUserSandboxes(ctx context.Context, clientset *kubernetes.Clientset, namespace string, systemName string) {
+	sanitizedSystem := sanitizeDNSName(systemName)
+	if sanitizedSystem == "" {
+		return
+	}
+
+	selector := fmt.Sprintf("system-name=%s", sanitizedSystem)
+
+	// Delete all pods with the system-name label
+	podList, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: selector,
+	})
+	if err == nil {
+		for _, pod := range podList.Items {
+			_ = clientset.CoreV1().Pods(namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
+			fmt.Printf("Auto-cleanup: deleted old pod %s for system %s\n", pod.Name, systemName)
+		}
+	}
+
+	// Delete all services with the system-name label
+	svcList, err := clientset.CoreV1().Services(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: selector,
+	})
+	if err == nil {
+		for _, svc := range svcList.Items {
+			_ = clientset.CoreV1().Services(namespace).Delete(ctx, svc.Name, metav1.DeleteOptions{})
+			fmt.Printf("Auto-cleanup: deleted old service %s for system %s\n", svc.Name, systemName)
+		}
+	}
+
+	// Delete all configmaps with the system-name label
+	cmList, err := clientset.CoreV1().ConfigMaps(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: selector,
+	})
+	if err == nil {
+		for _, cm := range cmList.Items {
+			_ = clientset.CoreV1().ConfigMaps(namespace).Delete(ctx, cm.Name, metav1.DeleteOptions{})
+			fmt.Printf("Auto-cleanup: deleted old configmap %s for system %s\n", cm.Name, systemName)
+		}
+	}
+
+	// Give K8s a moment to release resources
+	time.Sleep(1 * time.Second)
+}
+
+// sanitizeDNSName sanitizes a string to be a valid DNS subdomain name and K8s label value.
+func sanitizeDNSName(s string) string {
+	var sb strings.Builder
+	for _, r := range s {
+		isAlphaNum := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+		if isAlphaNum {
+			sb.WriteRune(r)
+		} else if r == '-' {
+			if sb.Len() > 0 {
+				sb.WriteRune(r)
+			}
+		}
+	}
+	res := sb.String()
+	// trim trailing hyphens
+	for len(res) > 0 && res[len(res)-1] == '-' {
+		res = res[:len(res)-1]
+	}
+	if len(res) > 50 {
+		res = res[:50]
+	}
+	return strings.ToLower(res)
+}
+
+func randomString(n int) string {
+	const letters = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, n)
+	for i := range b {
+		num, err := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
+		if err != nil {
+			b[i] = letters[0]
+		} else {
+			b[i] = letters[num.Int64()]
+		}
+	}
+	return string(b)
 }
 
 // CleanupSandbox deletes the pod, service, and configmap created for a sandbox

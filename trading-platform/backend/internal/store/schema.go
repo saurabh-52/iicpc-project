@@ -28,7 +28,7 @@ type SubmissionResult struct {
 	RawValidation    json.RawMessage `json:"raw_validation"`
 }
 
-// MigrationSQL is executed on first connection to create the submissions table.
+// MigrationSQL is executed on first connection to create the database schema.
 const MigrationSQL = `
 CREATE TABLE IF NOT EXISTS submission_results (
 	submission_id     TEXT PRIMARY KEY,
@@ -58,6 +58,55 @@ ON submission_results (total_score DESC);
 
 CREATE INDEX IF NOT EXISTS idx_submission_results_strategy
 ON submission_results (strategy, total_score DESC);
+
+CREATE TABLE IF NOT EXISTS contests (
+	id                  TEXT PRIMARY KEY,
+	name                TEXT NOT NULL,
+	description         TEXT NOT NULL DEFAULT '',
+	visibility          TEXT NOT NULL DEFAULT 'public',
+	code                TEXT NOT NULL DEFAULT '',
+	start_time          TIMESTAMPTZ NOT NULL,
+	duration_minutes    INT NOT NULL DEFAULT 60,
+	registration_deadline TIMESTAMPTZ,
+	created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS problems (
+	id                  TEXT PRIMARY KEY,
+	contest_id          TEXT NOT NULL REFERENCES contests(id) ON DELETE CASCADE,
+	code                TEXT NOT NULL DEFAULT '',
+	title               TEXT NOT NULL,
+	statement           TEXT NOT NULL,
+	time_limit          INT NOT NULL DEFAULT 1,
+	memory_limit        INT NOT NULL DEFAULT 256,
+	sample_strategies   TEXT[] NOT NULL DEFAULT '{}',
+	sample_bot_files    JSONB NOT NULL DEFAULT '[]',
+	sample_show_custom  BOOLEAN NOT NULL DEFAULT FALSE,
+	sample_target_injection TEXT NOT NULL DEFAULT 'env',
+	sample_protocol     TEXT NOT NULL DEFAULT 'http',
+	sample_telemetry_format TEXT NOT NULL DEFAULT 'stdout',
+	hidden_strategies   TEXT[] NOT NULL DEFAULT '{}',
+	hidden_bot_files    JSONB NOT NULL DEFAULT '[]',
+	hidden_show_custom  BOOLEAN NOT NULL DEFAULT FALSE,
+	hidden_target_injection TEXT NOT NULL DEFAULT 'env',
+	hidden_protocol     TEXT NOT NULL DEFAULT 'http',
+	hidden_telemetry_format TEXT NOT NULL DEFAULT 'stdout',
+	sequence            INT NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS contest_drafts (
+	id                  TEXT PRIMARY KEY DEFAULT 'current_draft',
+	details             JSONB NOT NULL DEFAULT '{}',
+	problems            JSONB NOT NULL DEFAULT '[]',
+	updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS contest_registrations (
+	contest_id          TEXT NOT NULL REFERENCES contests(id) ON DELETE CASCADE,
+	system_name         TEXT NOT NULL,
+	registered_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	PRIMARY KEY (contest_id, system_name)
+);
 `
 
 // NewSubmissionResult builds a SubmissionResult from scoring outputs.
