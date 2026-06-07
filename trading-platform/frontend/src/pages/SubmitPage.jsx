@@ -1,7 +1,9 @@
-import { useState } from 'react';
-import { Link } from 'react-router-dom';
+import { useState, useEffect } from 'react';
+import { Link, useLocation } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
 
 export default function SubmitPage() {
+  const { user, authHeaders } = useAuth();
   const languageExtensions = {
     cpp: ['cpp', 'cc', 'cxx'],
     go: ['go'],
@@ -9,19 +11,53 @@ export default function SubmitPage() {
     python: ['py'],
   };
 
+  const location = useLocation();
+  const queryParams = new URLSearchParams(location.search);
+  const urlContestId = queryParams.get('contest_id') || '';
+  const urlStrategy = queryParams.get('strategy') || '';
+
   const [formData, setFormData] = useState({
-    systemName: '',
+    systemName: user?.username || '',
     port: '8080',
     language: 'cpp',
     protocol: 'http',
-    strategy: 'bbo_heavy',
+    strategy: urlStrategy || 'bbo_heavy',
     rampUpSeconds: '0',
-    file: null
+    file: null,
+    contestId: urlContestId
   });
   const [submitState, setSubmitState] = useState({ type: '', message: '' });
   const [executionResult, setExecutionResult] = useState(null);
   const [stressTestResult, setStressTestResult] = useState(null);
+  const [stressTestMeta, setStressTestMeta] = useState(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [history, setHistory] = useState([]);
+  const [showHistory, setShowHistory] = useState(false);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+
+  // Auto-update systemName when user changes
+  useEffect(() => {
+    if (user?.username && !formData.systemName) {
+      setFormData(prev => ({ ...prev, systemName: user.username }));
+    }
+  }, [user]);
+
+  const fetchHistory = async () => {
+    setLoadingHistory(true);
+    setShowHistory(true);
+    try {
+      const res = await fetch('/api/history/me?limit=20', { headers: authHeaders() });
+      if (!res.ok) throw new Error("Failed to fetch history");
+      const data = await res.json();
+      setHistory(data.history || []);
+    } catch (e) {
+      console.error(e);
+      alert("Failed to load history.");
+      setShowHistory(false);
+    } finally {
+      setLoadingHistory(false);
+    }
+  };
 
   const handleChange = (e) => {
     const { name, value, files } = e.target;
@@ -49,6 +85,7 @@ export default function SubmitPage() {
     setSubmitState({ type: '', message: '' });
     setExecutionResult(null);
     setStressTestResult(null);
+    setStressTestMeta(null);
 
     const selectedFile = formData.file;
     if (!selectedFile) {
@@ -90,8 +127,10 @@ export default function SubmitPage() {
     });
 
     try {
+      const hdrs = authHeaders();
       const response = await fetch('/api/submit', {
         method: 'POST',
+        headers: hdrs,
         body: payload, // Do NOT set Content-Type header, the browser handles the boundary
       });
       const responseText = await response.text();
@@ -125,6 +164,7 @@ export default function SubmitPage() {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
+            ...authHeaders(),
           },
           body: JSON.stringify({
             target: sandboxExecution.target_url,
@@ -138,6 +178,8 @@ export default function SubmitPage() {
             path: '/',
             expect_reply: formData.protocol === 'tcp' || formData.protocol === 'fix',
             ramp_up_seconds: parseInt(formData.rampUpSeconds) || 0,
+            judging_mode: formData.contestId ? 'contest_live' : 'practice',
+            contest_id: formData.contestId || undefined,
           }),
         });
 
@@ -157,6 +199,10 @@ export default function SubmitPage() {
         }
 
         setStressTestResult(stressResult?.rounds?.[0]?.metrics || stressResult?.metrics || null);
+        setStressTestMeta({
+          judgingMode: stressResult?.rounds?.[0]?.judging_mode || 'practice',
+          seedUsed: stressResult?.rounds?.[0]?.seed_used || null,
+        });
 
         const roundCount = stressResult?.rounds?.length || 1;
         const strategies = (stressResult?.rounds || []).map(r => r.strategy).join(' + ');
@@ -191,6 +237,42 @@ export default function SubmitPage() {
           package and run the engine in isolation.
         </p>
 
+        {formData.contestId ? (
+          <div style={{
+            background: 'rgba(239, 68, 68, 0.1)',
+            border: '1px solid rgba(239, 68, 68, 0.3)',
+            borderRadius: '8px',
+            padding: '0.75rem 1rem',
+            marginBottom: '1rem',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.5rem',
+          }}>
+            <span style={{ fontSize: '1.2rem' }}>🔴</span>
+            <div>
+              <strong style={{ color: '#ef4444', fontSize: '0.85rem' }}>Contest Live Mode</strong>
+              <p style={{ margin: 0, fontSize: '0.78rem', opacity: 0.8 }}>Submitting for contest: {formData.contestId}. Scores will have 20% random variance.</p>
+            </div>
+          </div>
+        ) : (
+          <div style={{
+            background: 'rgba(99, 102, 241, 0.1)',
+            border: '1px solid rgba(99, 102, 241, 0.3)',
+            borderRadius: '8px',
+            padding: '0.75rem 1rem',
+            marginBottom: '1rem',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.5rem',
+          }}>
+            <span style={{ fontSize: '1.2rem' }}>⚡</span>
+            <div>
+              <strong style={{ color: 'var(--accent)', fontSize: '0.85rem' }}>Practice Mode</strong>
+              <p style={{ margin: 0, fontSize: '0.78rem', opacity: 0.8 }}>Deterministic results — same code, same input, same output every time.</p>
+            </div>
+          </div>
+        )}
+
         <div className="checklist">
           <div>
             <strong>Accepted files</strong>
@@ -203,6 +285,10 @@ export default function SubmitPage() {
           <div>
             <strong>Upload method</strong>
             <span>Multipart form data</span>
+          </div>
+          <div>
+            <strong>Judging mode</strong>
+            <span>100% fixed seed (reproducible)</span>
           </div>
         </div>
 
@@ -259,15 +345,25 @@ export default function SubmitPage() {
 
           <label className="field">
             <span>Stress Test Strategy</span>
-            <select name="strategy" value={formData.strategy} onChange={handleChange}>
-              <option value="bbo_heavy">BBO Heavy (Default)</option>
-              <option value="flash_crash">Flash Crash (Volatility)</option>
-              <option value="high_cancel">High Cancel Ratio (Spoofing)</option>
-              <option value="wide_spread">Wide Spread (Memory Hog)</option>
-              <option value="market_maker">Market Maker (Two-Sided Quoting)</option>
-              <option value="iceberg">Iceberg (Hidden Orders)</option>
-              <option value="momentum_burst">Momentum Burst (Trending Market)</option>
+            <select
+              name="strategy"
+              value={formData.strategy}
+              onChange={handleChange}
+              disabled={!!formData.contestId || isSubmitting}
+            >
+              <option value="bbo_heavy">BBO Heavy (Common)</option>
+              <option value="flash_crash">Flash Crash</option>
+              <option value="high_cancel">High Cancel Rate</option>
+              <option value="wide_spread">Wide Spread</option>
+              <option value="market_maker">Market Maker</option>
+              <option value="iceberg">Iceberg Orders</option>
+              <option value="momentum_burst">Momentum Burst</option>
             </select>
+            {formData.contestId && (
+              <span style={{ fontSize: '0.75rem', color: '#888', marginTop: '4px', display: 'block' }}>
+                Locked to contest strategy
+              </span>
+            )}
           </label>
 
           <div className="field-grid">
@@ -325,6 +421,39 @@ export default function SubmitPage() {
 
           {stressTestResult ? (
             <section className="result-panel">
+              {stressTestMeta ? (
+                <div style={{
+                  display: 'flex',
+                  gap: '0.5rem',
+                  marginBottom: '0.75rem',
+                  flexWrap: 'wrap',
+                }}>
+                  <span style={{
+                    background: 'rgba(99, 102, 241, 0.15)',
+                    color: 'var(--accent)',
+                    padding: '0.25rem 0.6rem',
+                    borderRadius: '6px',
+                    fontSize: '0.75rem',
+                    fontWeight: 600,
+                    textTransform: 'uppercase',
+                    letterSpacing: '0.5px',
+                  }}>
+                    ⚡ {stressTestMeta.judgingMode === 'practice' ? 'Practice' : stressTestMeta.judgingMode}
+                  </span>
+                  {stressTestMeta.seedUsed != null ? (
+                    <span style={{
+                      background: 'rgba(255, 255, 255, 0.05)',
+                      color: 'var(--muted)',
+                      padding: '0.25rem 0.6rem',
+                      borderRadius: '6px',
+                      fontSize: '0.75rem',
+                      fontFamily: 'monospace',
+                    }}>
+                      seed: 0x{stressTestMeta.seedUsed.toString(16)}
+                    </span>
+                  ) : null}
+                </div>
+              ) : null}
               <div className="result-row">
                 <span>Strategy</span>
                 <strong>{stressTestResult.strategy}</strong>
@@ -393,11 +522,62 @@ export default function SubmitPage() {
             </section>
           ) : null}
 
-          <button type="submit" className="button button-primary submit-button" disabled={isSubmitting}>
-            {isSubmitting ? 'Submitting...' : 'Deploy and launch stress test'}
-          </button>
+          <div style={{ display: 'flex', gap: '1rem', marginTop: '1.5rem' }}>
+            <button type="submit" className="button button-primary submit-button" disabled={isSubmitting} style={{ flex: 2 }}>
+              {isSubmitting ? 'Submitting...' : 'Deploy and launch stress test'}
+            </button>
+            <button type="button" className="button button-secondary submit-button" disabled={loadingHistory} onClick={fetchHistory} style={{ flex: 1, padding: '1rem 0' }}>
+              {loadingHistory ? 'Loading...' : 'View My History'}
+            </button>
+          </div>
         </form>
       </section>
+
+      {showHistory && (
+        <section className="submit-section panel" style={{ marginTop: '1.5rem' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+            <h2 style={{ fontSize: '1.2rem', margin: 0 }}>Submission History</h2>
+            <button 
+              className="button button-secondary" 
+              style={{ padding: '0.4rem 0.8rem', fontSize: '0.85rem' }}
+              onClick={() => setShowHistory(false)}
+            >
+              Close
+            </button>
+          </div>
+          
+          {history.length === 0 ? (
+            <p style={{ color: 'var(--muted)' }}>No practice submissions found for "{formData.systemName}".</p>
+          ) : (
+            <div style={{ overflowX: 'auto' }}>
+              <table style={{ width: '100%', textAlign: 'left', borderCollapse: 'collapse', fontSize: '0.9rem' }}>
+                <thead>
+                  <tr style={{ borderBottom: '1px solid var(--border)' }}>
+                    <th style={{ padding: '0.5rem' }}>Date</th>
+                    <th style={{ padding: '0.5rem' }}>Strategy</th>
+                    <th style={{ padding: '0.5rem' }}>Grade</th>
+                    <th style={{ padding: '0.5rem' }}>Score</th>
+                    <th style={{ padding: '0.5rem' }}>TPS</th>
+                    <th style={{ padding: '0.5rem' }}>Latency</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {history.map(run => (
+                    <tr key={run.submission_id} style={{ borderBottom: '1px solid var(--border)' }}>
+                      <td style={{ padding: '0.5rem', color: 'var(--muted)' }}>{new Date(run.submitted_at).toLocaleDateString()} {new Date(run.submitted_at).toLocaleTimeString()}</td>
+                      <td style={{ padding: '0.5rem' }}>{run.strategy}</td>
+                      <td style={{ padding: '0.5rem', fontWeight: 'bold' }}>{run.grade}</td>
+                      <td style={{ padding: '0.5rem' }}>{run.total_score?.toFixed(1)}</td>
+                      <td style={{ padding: '0.5rem' }}>{run.tps?.toFixed(0)}</td>
+                      <td style={{ padding: '0.5rem' }}>{run.p99_latency_ms?.toFixed(1)}ms</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      )}
     </section>
   );
 }

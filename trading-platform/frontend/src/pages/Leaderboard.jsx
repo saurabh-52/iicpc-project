@@ -1,5 +1,7 @@
 import { useState, useEffect } from 'react';
+import { useLocation } from 'react-router-dom';
 import useWebSocket from '../hooks/useWebSocket';
+import { useAuth } from '../context/AuthContext';
 
 const gradeColors = {
   S: { bg: 'linear-gradient(135deg, #fbbf24, #f59e0b)', color: '#78350f', glow: 'rgba(251,191,36,0.3)' },
@@ -138,25 +140,39 @@ function SubmissionDetail({ submission, onClose }) {
 }
 
 export default function Leaderboard() {
+  const { user } = useAuth();
   const [entries, setEntries] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [selected, setSelected] = useState(null);
   const [activeStrategy, setActiveStrategy] = useState('bbo_heavy');
+  const [modeFilter, setModeFilter] = useState('all'); // 'all' | 'practice' | 'contest_live' | 'contest_final'
   const { connected, updateTrigger } = useWebSocket();
+
+  const location = useLocation();
+  const queryParams = new URLSearchParams(location.search);
+  const contestId = queryParams.get('contest_id');
+  const isContestMode = !!contestId;
 
   // Fetch leaderboard with optional strategy filter
   const fetchLeaderboard = (strategy) => {
     const params = new URLSearchParams({ limit: '50' });
-    if (strategy) params.set('strategy', strategy);
+    if (strategy && !isContestMode) params.set('strategy', strategy);
 
-    fetch(`/api/leaderboard?${params.toString()}`)
+    const endpoint = isContestMode 
+      ? `/api/contests/${contestId}/leaderboard?${params.toString()}`
+      : `/api/leaderboard?${params.toString()}`;
+
+    fetch(endpoint)
       .then(res => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return res.json();
       })
       .then(data => {
         setEntries(data.leaderboard || []);
+        if (isContestMode && data.type) {
+          setModeFilter(data.type === 'final' ? 'contest_final' : 'contest_live');
+        }
         setLoading(false);
       })
       .catch(err => {
@@ -168,9 +184,11 @@ export default function Leaderboard() {
   // Fetch on load, on strategy change, or on live websocket update
   useEffect(() => {
     fetchLeaderboard(activeStrategy);
-  }, [activeStrategy, updateTrigger]);
+  }, [activeStrategy, updateTrigger, contestId]);
 
-  const displayEntries = entries;
+  const displayEntries = modeFilter === 'all'
+    ? entries
+    : entries.filter(e => (e.judging_mode || 'practice') === modeFilter);
 
   const handleStrategyChange = (strategy) => {
     setActiveStrategy(strategy);
@@ -202,8 +220,12 @@ export default function Leaderboard() {
       <div className="leaderboard-header panel">
         <div className="leaderboard-header-copy">
           <span className="section-tag">Leaderboard</span>
-          <h2>Trading Engine Rankings</h2>
-          <p>Real-time scores from benchmarked submissions. Engines are ranked by composite score across latency, throughput, and correctness.</p>
+          <h2>{isContestMode ? `Contest Leaderboard: ${contestId}` : 'Trading Engine Rankings'}</h2>
+          <p>
+            {isContestMode 
+              ? 'Real-time scores for this specific contest. Ranks are determined by the contest rules.'
+              : 'Real-time scores from benchmarked submissions. Engines are ranked by composite score across latency, throughput, and correctness.'}
+          </p>
         </div>
         <div className="leaderboard-status">
           <span className={`status-pill ${connected ? 'success' : 'offline'}`}>
@@ -213,18 +235,38 @@ export default function Leaderboard() {
         </div>
       </div>
 
-      {/* Strategy filter tabs */}
-      <div className="strategy-tabs panel">
-        {strategyTabs.map(tab => (
-          <button
-            key={tab.value}
-            className={`strategy-tab ${activeStrategy === tab.value ? 'active' : ''}`}
-            onClick={() => handleStrategyChange(tab.value)}
-          >
-            {tab.label}
-          </button>
-        ))}
-      </div>
+      {!isContestMode && (
+        <>
+          <div className="strategy-tabs panel" style={{ marginBottom: '0.5rem' }}>
+            {[
+              { value: 'all', label: '📊 All' },
+              { value: 'practice', label: '⚡ Practice' },
+              { value: 'contest_live', label: '🔴 Contest Live' },
+              { value: 'contest_final', label: '🏁 Contest Final' },
+            ].map(tab => (
+              <button
+                key={tab.value}
+                className={`strategy-tab ${modeFilter === tab.value ? 'active' : ''}`}
+                onClick={() => setModeFilter(tab.value)}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+
+          <div className="strategy-tabs panel">
+            {strategyTabs.map(tab => (
+              <button
+                key={tab.value}
+                className={`strategy-tab ${activeStrategy === tab.value ? 'active' : ''}`}
+                onClick={() => handleStrategyChange(tab.value)}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
 
       <details className="scoring-info panel">
         <summary>How is the Total Score calculated?</summary>
@@ -294,6 +336,7 @@ export default function Leaderboard() {
                 <tr>
                   <th>Rank</th>
                   <th>Engine</th>
+                  <th>Mode</th>
                   <th>Strategy</th>
                   <th>Grade</th>
                   <th>Score</th>
@@ -305,15 +348,37 @@ export default function Leaderboard() {
                 </tr>
               </thead>
               <tbody>
-                {displayEntries.map((entry, i) => (
+                {displayEntries.map((entry, i) => {
+                  const isMe = user && entry.system_name === user.username;
+                  return (
                   <tr
                     key={entry.submission_id}
-                    className={`lb-row ${i < 3 ? 'lb-row-top' : ''}`}
+                    className={`lb-row ${i < 3 ? 'lb-row-top' : ''} ${isMe ? 'lb-row-me' : ''}`}
                     onClick={() => setSelected(entry)}
                   >
                     <td className="rank-cell">{getRankEmoji(i)}</td>
                     <td className="id-cell" title={entry.submission_id}>
                       {displayName(entry)}
+                    </td>
+                    <td>
+                      <span style={{
+                        fontSize: '0.7rem',
+                        padding: '2px 6px',
+                        borderRadius: '4px',
+                        fontWeight: 600,
+                        background: (entry.judging_mode || 'practice') === 'practice'
+                          ? 'rgba(99, 102, 241, 0.1)'
+                          : (entry.judging_mode || 'practice') === 'contest_final'
+                          ? 'rgba(34, 197, 94, 0.1)'
+                          : 'rgba(239, 68, 68, 0.1)',
+                        color: (entry.judging_mode || 'practice') === 'practice'
+                          ? '#6366f1'
+                          : (entry.judging_mode || 'practice') === 'contest_final'
+                          ? '#22c55e'
+                          : '#ef4444',
+                      }}>
+                        {(entry.judging_mode || 'practice') === 'practice' ? '⚡' : (entry.judging_mode || 'practice') === 'contest_final' ? '🏁' : '🔴'}
+                      </span>
                     </td>
                     <td className="strategy-cell">{strategyLabel(entry.strategy)}</td>
                     <td><GradeBadge grade={entry.grade} /></td>
@@ -324,7 +389,8 @@ export default function Leaderboard() {
                     <td>{formatLatency(entry.p99_latency_ms)}</td>
                     <td>{formatTPS(entry.tps)}</td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>

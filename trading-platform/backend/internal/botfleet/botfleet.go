@@ -43,6 +43,15 @@ const (
 	StrategyMomentumBurst Strategy = "momentum_burst"
 )
 
+// JudgingMode controls how deterministic the order generation is.
+type JudgingMode string
+
+const (
+	ModePractice     JudgingMode = "practice"      // 100% fixed seed, fully deterministic
+	ModeContestLive  JudgingMode = "contest_live"   // 80% fixed + 20% random bots
+	ModeContestFinal JudgingMode = "contest_final"  // 100% fixed with edge-case seeds
+)
+
 type Config struct {
 	Target          string
 	Protocol        Protocol
@@ -59,6 +68,10 @@ type Config struct {
 	RampUpDuration  time.Duration // Gradual ramp-up: bots are staggered over this period
 	TelemetryClient *redis.Client // optional — nil disables telemetry publishing
 	SubmissionID    string        // used to tag telemetry events
+	JudgingMode     JudgingMode   // practice, contest_live, or contest_final
+	RandomRatio     float64       // fraction of bots using random seed (0.0–1.0), used in contest_live
+	ContestID       string        // optional — links result to a contest
+	FinalRound      int           // optional — which final round number (0 = not a final round)
 }
 
 // publishAsync sends a TelemetryEvent to Redis in a fire-and-forget goroutine.
@@ -141,6 +154,47 @@ func NormalizeStrategy(value string) Strategy {
 	}
 }
 
+// NormalizeJudgingMode returns a valid JudgingMode from a string, defaulting to ModePractice.
+func NormalizeJudgingMode(value string) JudgingMode {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case string(ModeContestLive):
+		return ModeContestLive
+	case string(ModeContestFinal):
+		return ModeContestFinal
+	default:
+		return ModePractice
+	}
+}
+
+// DeterministicSeedForStrategy computes a fixed, deterministic seed from the strategy name.
+func DeterministicSeedForStrategy(strategy Strategy) int64 {
+	var fixedSeed int64 = 0xdeadbeef
+	for _, c := range strategy {
+		fixedSeed = fixedSeed*31 + int64(c)
+	}
+	return fixedSeed
+}
+
+// PreGenerateOrders creates a deterministic, reproducible slice of orders for a
+// given strategy, seed, and count. Workers in practice/final modes pull from this
+// slice instead of generating on-the-fly, eliminating goroutine scheduling
+// non-determinism.
+func PreGenerateOrders(strategy Strategy, seed int64, count int, botCount int) []Order {
+	orders := make([]Order, 0, count)
+	baseTime := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	for i := 0; i < count; i++ {
+		botID := i % botCount
+		seq := (i / botCount) + 1
+		rng := rand.New(rand.NewSource(seed + int64(botID)*7919 + int64(seq)*13))
+		order := generateOrder(strategy, botID, seq, rng)
+		// Use synthetic timestamp for full determinism
+		order.CreatedAt = baseTime.Add(time.Duration(i) * time.Millisecond)
+		orders = append(orders, order)
+	}
+	return orders
+}
+
 func Run(ctx context.Context, cfg Config) (Summary, error) {
 	if cfg.Target == "" {
 		return Summary{}, fmt.Errorf("target is required")
@@ -160,14 +214,21 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 	if cfg.ContentType == "" {
 		cfg.ContentType = "application/json"
 	}
+	// Default judging mode to practice
+	if cfg.JudgingMode == "" {
+		cfg.JudgingMode = ModePractice
+	}
 	if cfg.Seed == 0 {
-		// Generate a fixed, deterministic seed based on the strategy name.
-		// This guarantees that the same strategy always produces the exact same sequence of orders.
-		var fixedSeed int64 = 0xdeadbeef
-		for _, c := range cfg.Strategy {
-			fixedSeed = fixedSeed*31 + int64(c)
+		cfg.Seed = DeterministicSeedForStrategy(cfg.Strategy)
+	}
+	// Enforce random ratio based on judging mode
+	switch cfg.JudgingMode {
+	case ModeContestLive:
+		if cfg.RandomRatio <= 0 {
+			cfg.RandomRatio = 0.2 // 20% random bots
 		}
-		cfg.Seed = fixedSeed
+	case ModePractice, ModeContestFinal:
+		cfg.RandomRatio = 0.0 // Fully deterministic
 	}
 
 	start := time.Now()
@@ -176,6 +237,15 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 	var wg sync.WaitGroup
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	// Determine how many bots are "fixed" vs "random" based on judging mode.
+	fixedBotCount := cfg.Bots
+	if cfg.JudgingMode == ModeContestLive && cfg.RandomRatio > 0 {
+		fixedBotCount = int(float64(cfg.Bots) * (1.0 - cfg.RandomRatio))
+		if fixedBotCount < 1 {
+			fixedBotCount = 1
+		}
+	}
 
 	for botID := 0; botID < cfg.Bots; botID++ {
 		wg.Add(1)
@@ -192,7 +262,15 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 				}
 			}
 
-			rng := rand.New(rand.NewSource(cfg.Seed + int64(botID)*7919))
+			// Choose seed: fixed bots use the deterministic seed,
+			// random bots (contest_live only) use a time-based random seed.
+			var botSeed int64
+			if botID < fixedBotCount {
+				botSeed = cfg.Seed + int64(botID)*7919
+			} else {
+				botSeed = time.Now().UnixNano() + int64(botID)*7919
+			}
+			rng := rand.New(rand.NewSource(botSeed))
 			seq := 0
 
 			switch cfg.Protocol {
@@ -463,6 +541,11 @@ func claimWork(ctx context.Context, cfg Config, sent *int64) bool {
 		return false
 	}
 	return true
+}
+
+// GenerateOrder is the exported version of generateOrder for use by finalizer and tests.
+func GenerateOrder(strategy Strategy, botID int, sequence int, rng *rand.Rand) Order {
+	return generateOrder(strategy, botID, sequence, rng)
 }
 
 func generateOrder(strategy Strategy, botID int, sequence int, rng *rand.Rand) Order {

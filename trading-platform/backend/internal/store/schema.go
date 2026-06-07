@@ -26,10 +26,42 @@ type SubmissionResult struct {
 	OrdersProcessed  int             `json:"orders_processed"`
 	RawMetrics       json.RawMessage `json:"raw_metrics"`
 	RawValidation    json.RawMessage `json:"raw_validation"`
+	JudgingMode      string          `json:"judging_mode"`
+	ContestID        string          `json:"contest_id,omitempty"`
+	FinalRound       *int            `json:"final_round,omitempty"`
+	SeedUsed         int64           `json:"seed_used"`
+	UserID           string          `json:"user_id"`
+}
+
+// ContestFinalScore represents a post-contest averaged score for a team.
+type ContestFinalScore struct {
+	ContestID   string          `json:"contest_id"`
+	SystemName  string          `json:"system_name"`
+	AvgScore    float64         `json:"avg_score"`
+	RoundScores json.RawMessage `json:"round_scores"`
+	FinalGrade  string          `json:"final_grade"`
+	FinalizedAt time.Time       `json:"finalized_at"`
+}
+
+// User represents a registered user account.
+type User struct {
+	ID           string `json:"id"`
+	Username     string `json:"username"`
+	Email        string `json:"email"`
+	PasswordHash string `json:"-"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 // MigrationSQL is executed on first connection to create the database schema.
 const MigrationSQL = `
+CREATE TABLE IF NOT EXISTS users (
+	id            TEXT PRIMARY KEY,
+	username      TEXT UNIQUE NOT NULL,
+	email         TEXT UNIQUE NOT NULL,
+	password_hash TEXT NOT NULL,
+	created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS submission_results (
 	submission_id     TEXT PRIMARY KEY,
 	system_name       TEXT NOT NULL DEFAULT '',
@@ -71,6 +103,11 @@ CREATE TABLE IF NOT EXISTS contests (
 	created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Ensure strategy and final_strategies are added to contests
+ALTER TABLE contests ADD COLUMN IF NOT EXISTS strategy TEXT NOT NULL DEFAULT 'bbo_heavy';
+ALTER TABLE contests ADD COLUMN IF NOT EXISTS final_strategies TEXT[] NOT NULL DEFAULT '{"bbo_heavy", "flash_crash", "high_cancel", "iceberg", "momentum_burst"}';
+
+
 CREATE TABLE IF NOT EXISTS problems (
 	id                  TEXT PRIMARY KEY,
 	contest_id          TEXT NOT NULL REFERENCES contests(id) ON DELETE CASCADE,
@@ -107,11 +144,47 @@ CREATE TABLE IF NOT EXISTS contest_registrations (
 	registered_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 	PRIMARY KEY (contest_id, system_name)
 );
+
+-- Judging mode and contest linkage for submission results
+ALTER TABLE submission_results ADD COLUMN IF NOT EXISTS judging_mode TEXT NOT NULL DEFAULT 'practice';
+ALTER TABLE submission_results ADD COLUMN IF NOT EXISTS contest_id TEXT;
+ALTER TABLE submission_results ADD COLUMN IF NOT EXISTS final_round INT;
+ALTER TABLE submission_results ADD COLUMN IF NOT EXISTS seed_used BIGINT NOT NULL DEFAULT 0;
+
+CREATE INDEX IF NOT EXISTS idx_submission_results_judging_mode
+ON submission_results (judging_mode);
+
+CREATE INDEX IF NOT EXISTS idx_submission_results_contest_id
+ON submission_results (contest_id, total_score DESC);
+
+-- Contest phase lifecycle (upcoming → live → finalizing → completed)
+ALTER TABLE contests ADD COLUMN IF NOT EXISTS phase TEXT NOT NULL DEFAULT 'upcoming';
+
+-- Post-contest final averaged scores per team
+CREATE TABLE IF NOT EXISTS contest_final_scores (
+	contest_id    TEXT NOT NULL REFERENCES contests(id) ON DELETE CASCADE,
+	system_name   TEXT NOT NULL,
+	avg_score     FLOAT8 NOT NULL DEFAULT 0,
+	round_scores  JSONB NOT NULL DEFAULT '[]',
+	final_grade   TEXT NOT NULL DEFAULT 'F',
+	finalized_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	PRIMARY KEY (contest_id, system_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_contest_final_scores_ranking
+ON contest_final_scores (contest_id, avg_score DESC);
+
+-- User linkage for submissions and registrations
+ALTER TABLE submission_results ADD COLUMN IF NOT EXISTS user_id TEXT;
+ALTER TABLE contest_registrations ADD COLUMN IF NOT EXISTS user_id TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_submission_results_user_id
+ON submission_results (user_id, submitted_at DESC);
 `
 
 // NewSubmissionResult builds a SubmissionResult from scoring outputs.
 func NewSubmissionResult(
-	submissionID, systemName, strategy, language string,
+	submissionID, systemName, strategy, language, userID string,
 	sc scorer.Score,
 	metrics scorer.PerformanceMetrics,
 	val validator.ValidationResult,
@@ -136,5 +209,25 @@ func NewSubmissionResult(
 		OrdersProcessed:  val.OrdersProcessed,
 		RawMetrics:       rawMetrics,
 		RawValidation:    rawValidation,
+		JudgingMode:      "practice",
+		UserID:           userID,
 	}
+}
+
+// NewSubmissionResultWithMode builds a SubmissionResult with explicit judging mode and contest metadata.
+func NewSubmissionResultWithMode(
+	submissionID, systemName, strategy, language, userID string,
+	sc scorer.Score,
+	metrics scorer.PerformanceMetrics,
+	val validator.ValidationResult,
+	judgingMode, contestID string,
+	finalRound *int,
+	seedUsed int64,
+) SubmissionResult {
+	sr := NewSubmissionResult(submissionID, systemName, strategy, language, userID, sc, metrics, val)
+	sr.JudgingMode = judgingMode
+	sr.ContestID = contestID
+	sr.FinalRound = finalRound
+	sr.SeedUsed = seedUsed
+	return sr
 }

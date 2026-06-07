@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
 
 /* ═══════════════════════════════════════
    CONSTANTS
@@ -221,16 +223,24 @@ function normalizeContests(dbContests) {
 }
 
 export default function ContestPage() {
+  const { user, authHeaders } = useAuth();
   const [view, setView] = useState('landing');
   const [dbContests, setDbContests] = useState([]);
   const [loading, setLoading] = useState(false);
 
   const [registeredContestIds, setRegisteredContestIds] = useState([]);
   const [registeringContest, setRegisteringContest] = useState(null);
-  const [regSystemName, setRegSystemName] = useState(localStorage.getItem('reg_system_name') || '');
+  const [regSystemName, setRegSystemName] = useState('');
   const [regCode, setRegCode] = useState('');
   const [regMessage, setRegMessage] = useState('');
   const [regSubmitting, setRegSubmitting] = useState(false);
+
+  // Auto-fill system name from user
+  useEffect(() => {
+    if (user?.username) {
+      setRegSystemName(user.username);
+    }
+  }, [user]);
 
   const fetchContests = async () => {
     setLoading(true);
@@ -281,7 +291,7 @@ export default function ContestPage() {
     try {
       const res = await fetch(`/api/contests/${registeringContest.id}/register`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ systemName: regSystemName, code: regCode })
       });
       const data = await res.json();
@@ -500,17 +510,72 @@ function LandingView({ onNavigate, upcomingContests = [], pastContests = [], loa
 
 function ContestCard({ contest, type, onRegister, isRegistered }) {
   const isPast = type === 'past';
+  const navigate = useNavigate();
+  const now = new Date();
+  const start = new Date(contest.startTime);
+  const end = new Date(start.getTime() + (contest.duration || 60) * 60000);
+  const isLive = now >= start && now < end;
+  const isEnded = now >= end;
+
+  const [finalizing, setFinalizing] = useState(false);
+  const [finalizeMsg, setFinalizeMsg] = useState('');
+
+  const handleFinalize = async () => {
+    if (!confirm('Run final evaluation rounds? This will re-evaluate all submissions with 5 deterministic test suites.')) return;
+    setFinalizing(true);
+    setFinalizeMsg('');
+    try {
+      const res = await fetch(`/api/contests/${contest.id}/finalize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ bot_count: 32, duration_seconds: 10 }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || 'Finalization failed');
+      setFinalizeMsg(`✓ Finalization started (${data.teams} teams, ${data.rounds} rounds)`);
+    } catch (err) {
+      setFinalizeMsg('⚠ ' + err.message);
+    } finally {
+      setFinalizing(false);
+    }
+  };
 
   return (
     <div className={`cp-contest-card ${isPast ? 'cp-card-past' : ''}`}>
       <div className="cp-contest-card-top">
         <div className="cp-contest-status-row">
-          <span className={`cp-status-tag ${isPast ? 'ended' : 'upcoming'}`}>
-            {isPast ? '✓ Ended' : '● ' + timeUntil(contest.startTime)}
+          <span className={`cp-status-tag ${isPast ? 'ended' : isLive ? 'live' : 'upcoming'}`}>
+            {isPast ? '✓ Ended' : isLive ? '🔴 Live' : '● ' + timeUntil(contest.startTime)}
           </span>
           <span className={`cp-visibility-tag ${contest.visibility}`}>
             {contest.visibility === 'public' ? '🌍 Public' : '🔒 Private'}
           </span>
+          {contest.strategy && (
+            <span style={{
+              background: 'rgba(96, 165, 250, 0.1)',
+              color: '#60a5fa',
+              padding: '2px 8px',
+              borderRadius: '6px',
+              fontSize: '0.7rem',
+              fontWeight: 600,
+              letterSpacing: '0.5px',
+            }}>
+              🎯 {contest.strategy.replace(/_/g, ' ')}
+            </span>
+          )}
+          {isLive && (
+            <span style={{
+              background: 'rgba(239, 68, 68, 0.1)',
+              color: '#ef4444',
+              padding: '2px 8px',
+              borderRadius: '6px',
+              fontSize: '0.7rem',
+              fontWeight: 600,
+              letterSpacing: '0.5px',
+            }}>
+              80% Fixed + 20% Random
+            </span>
+          )}
         </div>
         <h4 className="cp-contest-name">{contest.name}</h4>
         <p className="cp-contest-desc">{contest.description}</p>
@@ -536,7 +601,20 @@ function ContestCard({ contest, type, onRegister, isRegistered }) {
           </div>
         </div>
 
-        {!isPast ? (
+        {finalizeMsg && (
+          <div style={{
+            fontSize: '0.8rem',
+            padding: '6px 10px',
+            borderRadius: '6px',
+            marginBottom: '8px',
+            background: finalizeMsg.includes('✓') ? 'rgba(34, 197, 94, 0.1)' : 'rgba(239, 68, 68, 0.1)',
+            color: finalizeMsg.includes('✓') ? '#22c55e' : '#ef4444',
+          }}>
+            {finalizeMsg}
+          </div>
+        )}
+
+        {!isPast && !isLive ? (
           isRegistered ? (
             <button className="cw-button cw-button-ghost cp-register-btn" disabled style={{ borderColor: '#22c55e', color: '#22c55e', background: 'rgba(34, 197, 94, 0.05)', cursor: 'default' }}>
               Registered ✓
@@ -546,8 +624,41 @@ function ContestCard({ contest, type, onRegister, isRegistered }) {
               Register →
             </button>
           )
+        ) : isLive ? (
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <button 
+              className="cw-button cw-button-primary cp-register-btn" 
+              style={{ background: '#ef4444', flex: 2 }}
+              onClick={() => navigate(`/submit?contest_id=${contest.id}&strategy=${contest.strategy || 'bbo_heavy'}`)}
+            >
+              🔴 Submit
+            </button>
+            <button 
+              className="cw-button cw-button-secondary cp-register-btn" 
+              style={{ flex: 1, padding: '0 12px' }}
+              onClick={() => navigate(`/leaderboard?contest_id=${contest.id}`)}
+            >
+              Leaderboard
+            </button>
+          </div>
         ) : (
-          <button className="cw-button cw-button-ghost cp-register-btn">View Results</button>
+          <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+            <button 
+              className="cw-button cw-button-secondary cp-register-btn" 
+              style={{ flex: 1, padding: '0 12px' }}
+              onClick={() => navigate(`/leaderboard?contest_id=${contest.id}`)}
+            >
+              View Leaderboard
+            </button>
+            <button
+              className="cw-button cw-button-primary cp-register-btn"
+              onClick={handleFinalize}
+              disabled={finalizing}
+              style={{ flex: 1, fontSize: '0.82rem' }}
+            >
+              {finalizing ? 'Finalizing...' : '🏁 Run Final Rounds'}
+            </button>
+          </div>
         )}
       </div>
     </div>
@@ -641,6 +752,8 @@ function HostContestWizard({ onBack }) {
     startTime: '',
     durationMinutes: 60,
     registrationDeadline: '',
+    strategy: 'bbo_heavy',
+    finalStrategies: ['bbo_heavy', 'flash_crash', 'high_cancel', 'iceberg', 'momentum_burst'],
   });
 
   const [problems, setProblems] = useState([]);
@@ -976,6 +1089,34 @@ function HostContestWizard({ onBack }) {
                       <span className="cw-label">Duration (minutes)</span>
                       <input className="cw-input" type="number" min={5} value={details.durationMinutes} onChange={(e) => setDetails({ ...details, durationMinutes: Number(e.target.value) })} />
                     </label>
+                  </div>
+                  <div className="cw-field-row cw-field-row-2">
+                    <label className="cw-field">
+                      <span className="cw-label">Live Contest Strategy <span className="cw-required">*</span></span>
+                      <select className="cw-input cw-select" value={details.strategy || 'bbo_heavy'} onChange={(e) => setDetails({ ...details, strategy: e.target.value })}>
+                        {STRATEGIES.map(s => (
+                          <option key={s} value={s}>{s.replace(/_/g, ' ')}</option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+                  <div className="cw-field" style={{ marginTop: '16px' }}>
+                    <span className="cw-label">Final Evaluation Strategies <span className="cw-required">*</span></span>
+                    <span className="cw-field-desc" style={{ fontSize: '0.82rem', color: 'var(--text-muted, #888)', display: 'block', marginBottom: '8px' }}>
+                      Select the baseline profiles used for post-contest evaluation rounds.
+                    </span>
+                    <div className="cw-strategy-chips" style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+                      {STRATEGIES.map((s) => (
+                        <label key={s} className={`cw-chip ${(details.finalStrategies || []).includes(s) ? 'active' : ''}`}>
+                          <input type="checkbox" hidden checked={(details.finalStrategies || []).includes(s)} onChange={(e) => {
+                            const next = new Set(details.finalStrategies || []);
+                            if (e.target.checked) next.add(s); else next.delete(s);
+                            setDetails({ ...details, finalStrategies: Array.from(next) });
+                          }} />
+                          {s.replace(/_/g, ' ')}
+                        </label>
+                      ))}
+                    </div>
                   </div>
                   {details.visibility === 'private' && (
                     <label className="cw-field">

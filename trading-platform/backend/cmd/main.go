@@ -16,6 +16,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/Saurabh-52/trading-platform/internal/auth"
 	"github.com/Saurabh-52/trading-platform/internal/botfleet"
 	"github.com/Saurabh-52/trading-platform/internal/sandbox"
 	"github.com/Saurabh-52/trading-platform/internal/scorer"
@@ -48,6 +49,8 @@ type stressTestRequest struct {
 	Path          string `json:"path"`
 	ExpectReply   bool   `json:"expect_reply"`
 	RampUpSecs    int    `json:"ramp_up_seconds"`
+	JudgingMode   string `json:"judging_mode"`
+	ContestID     string `json:"contest_id"`
 }
 
 func extensionForLanguage(language string) (string, error) {
@@ -147,7 +150,9 @@ func buildTargetURL(result sandbox.ExecutionResult, protocol string, containerPo
 	}
 
 	portToUse := containerPort
-	if result.NodePort > 0 {
+	// If minikube IP is explicitly provided, use NodePort since that's how we reach it.
+	// Otherwise, assume local development via minikube tunnel, which exposes the LoadBalancer on 127.0.0.1:containerPort
+	if result.NodePort > 0 && hostIP != "127.0.0.1" {
 		portToUse = int(result.NodePort)
 	}
 
@@ -184,7 +189,7 @@ func main() {
 	var redisClient *redis.Client
 	redisAddr := os.Getenv("REDIS_ADDR")
 	if redisAddr == "" {
-		redisAddr = "localhost:6379"
+		redisAddr = "127.0.0.1:6379"
 	}
 	rc, err := telemetry.NewRedisClient(redisAddr)
 	if err != nil {
@@ -198,7 +203,7 @@ func main() {
 	var db *store.Store
 	pgURL := os.Getenv("POSTGRES_URL")
 	if pgURL == "" {
-		pgURL = "postgres://user:password@localhost:5432/postgres?sslmode=disable"
+		pgURL = "postgres://user:password@127.0.0.1:5432/postgres?sslmode=disable"
 	}
 	dbConn, err := store.NewStore(context.Background(), pgURL)
 	if err != nil {
@@ -225,6 +230,151 @@ func main() {
 		ws.HandleConnection(hub, c)
 	}))
 
+	// ─── Auth routes ────────────────────────────────────────────────────────
+	app.Post("/register", func(c *fiber.Ctx) error {
+		if db == nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"message": "database not available"})
+		}
+
+		var payload struct {
+			Username string `json:"username"`
+			Email    string `json:"email"`
+			Password string `json:"password"`
+		}
+		if err := c.BodyParser(&payload); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "invalid payload", "error": err.Error()})
+		}
+
+		username := strings.TrimSpace(payload.Username)
+		email := strings.TrimSpace(payload.Email)
+		password := payload.Password
+
+		if username == "" || email == "" || password == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "username, email, and password are required"})
+		}
+		if len(password) < 6 {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "password must be at least 6 characters"})
+		}
+		if len(username) < 3 {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "username must be at least 3 characters"})
+		}
+
+		// Check uniqueness
+		if _, err := db.GetUserByUsername(c.Context(), username); err == nil {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"message": "username already taken"})
+		}
+		if _, err := db.GetUserByEmail(c.Context(), email); err == nil {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"message": "email already registered"})
+		}
+
+		hash, err := auth.HashPassword(password)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "failed to hash password"})
+		}
+
+		userID := fmt.Sprintf("usr-%d-%s", time.Now().UnixNano(), randomString(6))
+		if err := db.CreateUser(c.Context(), userID, username, email, hash); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "failed to create user", "error": err.Error()})
+		}
+
+		token, err := auth.GenerateJWT(userID, username)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "failed to generate token"})
+		}
+
+		return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+			"message": "Registration successful",
+			"token":   token,
+			"user": fiber.Map{
+				"id":       userID,
+				"username": username,
+				"email":    email,
+			},
+		})
+	})
+
+	app.Post("/login", func(c *fiber.Ctx) error {
+		if db == nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"message": "database not available"})
+		}
+
+		var payload struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		}
+		if err := c.BodyParser(&payload); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "invalid payload", "error": err.Error()})
+		}
+
+		username := strings.TrimSpace(payload.Username)
+		password := payload.Password
+
+		if username == "" || password == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "username and password are required"})
+		}
+
+		user, err := db.GetUserByUsername(c.Context(), username)
+		if err != nil {
+			log.Printf("LOGIN FAILED: user '%s' not found or db error: %v", username, err)
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"message": "invalid username or password"})
+		}
+
+		if !auth.CheckPassword(user.PasswordHash, password) {
+			log.Printf("LOGIN FAILED: password mismatch for user '%s' (provided pass length: %d)", username, len(password))
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"message": "invalid username or password"})
+		}
+
+		token, err := auth.GenerateJWT(user.ID, user.Username)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "failed to generate token"})
+		}
+
+		return c.JSON(fiber.Map{
+			"message": "Login successful",
+			"token":   token,
+			"user": fiber.Map{
+				"id":       user.ID,
+				"username": user.Username,
+				"email":    user.Email,
+			},
+		})
+	})
+
+	app.Get("/me", auth.AuthMiddleware(), func(c *fiber.Ctx) error {
+		if db == nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"message": "database not available"})
+		}
+		userID := c.Locals("user_id").(string)
+		user, err := db.GetUserByID(c.Context(), userID)
+		if err != nil {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"message": "user not found"})
+		}
+		return c.JSON(fiber.Map{
+			"user": fiber.Map{
+				"id":       user.ID,
+				"username": user.Username,
+				"email":    user.Email,
+			},
+		})
+	})
+
+	// User's own submission history (requires auth)
+	app.Get("/history/me", auth.AuthMiddleware(), func(c *fiber.Ctx) error {
+		if db == nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"message": "database not available"})
+		}
+		userID := c.Locals("user_id").(string)
+		limit, _ := strconv.Atoi(c.Query("limit", "50"))
+		if limit <= 0 || limit > 100 {
+			limit = 50
+		}
+		results, err := db.GetUserHistory(c.Context(), userID, limit)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "history query failed", "error": err.Error()})
+		}
+		return c.JSON(fiber.Map{"history": results})
+	})
+
 	// --- Leaderboard & Submission lookup ---
 	app.Get("/leaderboard", func(c *fiber.Ctx) error {
 		if db == nil {
@@ -249,6 +399,27 @@ func main() {
 		return c.JSON(fiber.Map{"leaderboard": results})
 	})
 
+	app.Get("/history/:systemName", func(c *fiber.Ctx) error {
+		if db == nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"message": "database not available"})
+		}
+		systemName := c.Params("systemName")
+		if strings.TrimSpace(systemName) == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "systemName is required"})
+		}
+		
+		limit, _ := strconv.Atoi(c.Query("limit", "50"))
+		if limit <= 0 || limit > 100 {
+			limit = 50
+		}
+
+		results, err := db.GetSubmissionHistory(c.Context(), systemName, limit)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "history query failed", "error": err.Error()})
+		}
+		return c.JSON(fiber.Map{"history": results})
+	})
+
 	app.Get("/submission/:id", func(c *fiber.Ctx) error {
 		if db == nil {
 			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"message": "database not available"})
@@ -261,7 +432,7 @@ func main() {
 	})
 
 	// The endpoint where contestants submit their code
-	app.Post("/submit", func(c *fiber.Ctx) error {
+	app.Post("/submit", auth.AuthMiddleware(), func(c *fiber.Ctx) error {
 		defer func() {
 			if r := recover(); r != nil {
 				fmt.Println("PANIC in /submit:", r)
@@ -412,7 +583,7 @@ func main() {
 		return c.JSON(response)
 	})
 
-	app.Post("/stress-test", func(c *fiber.Ctx) error {
+	app.Post("/stress-test", auth.AuthMiddleware(), func(c *fiber.Ctx) error {
 		var req stressTestRequest
 		if err := c.BodyParser(&req); err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "invalid stress-test payload", "error": err.Error()})
@@ -432,16 +603,20 @@ func main() {
 
 		userStrategy := botfleet.NormalizeStrategy(req.Strategy)
 		systemName := strings.TrimSpace(req.SystemName)
+		judgingMode := botfleet.NormalizeJudgingMode(req.JudgingMode)
 
 		// --- Helper: run one stress-test round and score it ---
 		type roundResult struct {
 			SubmissionID string          `json:"submission_id"`
 			Strategy     string          `json:"strategy"`
+			JudgingMode  string          `json:"judging_mode"`
+			SeedUsed     int64           `json:"seed_used"`
 			Metrics      botfleet.Summary `json:"metrics"`
 			Score        *scorer.Score   `json:"score,omitempty"`
 		}
 		runRound := func(strategy botfleet.Strategy, idSuffix string) (roundResult, error) {
 			submissionID := fmt.Sprintf("stress-%d%s", time.Now().UnixNano(), idSuffix)
+			seed := botfleet.DeterministicSeedForStrategy(strategy)
 
 			roundCtx, roundCancel := context.WithTimeout(context.Background(), duration+timeout+5*time.Second)
 			defer roundCancel()
@@ -460,6 +635,9 @@ func main() {
 				RampUpDuration:  time.Duration(req.RampUpSecs) * time.Second,
 				TelemetryClient: redisClient,
 				SubmissionID:    submissionID,
+				JudgingMode:     judgingMode,
+				ContestID:       req.ContestID,
+				Seed:            seed,
 			})
 			if err != nil {
 				return roundResult{}, err
@@ -468,6 +646,8 @@ func main() {
 			rr := roundResult{
 				SubmissionID: submissionID,
 				Strategy:     string(strategy),
+				JudgingMode:  string(judgingMode),
+				SeedUsed:     seed,
 				Metrics:      metrics,
 			}
 
@@ -484,7 +664,16 @@ func main() {
 					rr.Score = &sc
 
 					if db != nil {
-						sr := store.NewSubmissionResult(submissionID, systemName, string(strategy), "", sc, perfMetrics, valResult)
+						// Extract user_id from the request context (set by auth middleware)
+						submitUserID := ""
+						if uid, ok := c.Locals("user_id").(string); ok {
+							submitUserID = uid
+						}
+						sr := store.NewSubmissionResultWithMode(
+							submissionID, systemName, string(strategy), "", submitUserID,
+							sc, perfMetrics, valResult,
+							string(judgingMode), req.ContestID, nil, seed,
+						)
 						if storeErr := db.CreateSubmissionResult(scoreCtx, sr); storeErr != nil {
 							log.Printf("WARNING: failed to persist scoring result for %s: %v", strategy, storeErr)
 						}
@@ -635,6 +824,8 @@ func main() {
 				StartTime            string `json:"startTime"`
 				DurationMinutes      int    `json:"durationMinutes"`
 				RegistrationDeadline string `json:"registrationDeadline"`
+				Strategy             string `json:"strategy"`
+				FinalStrategies      []string `json:"finalStrategies"`
 			} `json:"details"`
 			Problems []struct {
 				ID                    string `json:"id"`
@@ -741,7 +932,7 @@ func main() {
 
 		err = db.PublishContest(c.Context(), contestID,
 			payload.Details.Name, payload.Details.Description, payload.Details.Visibility, payload.Details.Code,
-			startTime, payload.Details.DurationMinutes, regDeadline, problemsData,
+			startTime, payload.Details.DurationMinutes, regDeadline, payload.Details.Strategy, payload.Details.FinalStrategies, problemsData,
 		)
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "failed to publish contest", "error": err.Error()})
@@ -753,6 +944,183 @@ func main() {
 		})
 	})
 
-	log.Println("Platform API running on port 3000")
-	log.Fatal(app.Listen(":3000"))
+	// --- Contest finalization: admin triggers post-contest final rounds ---
+	app.Post("/contests/:id/finalize", func(c *fiber.Ctx) error {
+		if db == nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"message": "database not available"})
+		}
+
+		contestID := c.Params("id")
+		if strings.TrimSpace(contestID) == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "contest ID is required"})
+		}
+
+		// Get contest details and verify it has ended
+		contest, err := db.GetContest(c.Context(), contestID)
+		if err != nil {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"message": "contest not found", "error": err.Error()})
+		}
+
+		endTime := contest.StartTime.Add(time.Duration(contest.DurationMinutes) * time.Minute)
+		if time.Now().Before(endTime) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"message": "contest has not ended yet",
+				"end_time": endTime.Format(time.RFC3339),
+			})
+		}
+
+		// Parse optional config from request body
+		var body struct {
+			BotCount     int `json:"bot_count"`
+			DurationSecs int `json:"duration_seconds"`
+			RequestCount int `json:"request_count"`
+		}
+		_ = c.BodyParser(&body)
+		if body.BotCount <= 0 {
+			body.BotCount = 32
+		}
+		if body.DurationSecs <= 0 {
+			body.DurationSecs = 10
+		}
+
+		// Set contest phase to finalizing
+		if err := db.UpdateContestPhase(c.Context(), contestID, "finalizing"); err != nil {
+			log.Printf("WARNING: failed to set contest phase to finalizing: %v", err)
+		}
+
+		// Get all registered teams
+		teams, err := db.GetContestRegistrations(c.Context(), contestID)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "failed to get registrations", "error": err.Error()})
+		}
+
+		if len(teams) == 0 {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "no teams registered for this contest"})
+		}
+
+		// NOTE: In a real deployment, each team's sandbox would need to be running.
+		// For now, we accept target_url as a parameter per team or use a convention.
+		// This is a simplified version that demonstrates the finalization flow.
+		log.Printf("[Finalize] Starting finalization for contest %s with %d teams", contestID, len(teams))
+
+		// Build FinalRounds array from contest.FinalStrategies
+		var finalRounds []botfleet.FinalRoundDef
+		if len(contest.FinalStrategies) > 0 {
+			for i, strat := range contest.FinalStrategies {
+				// Deterministic but strategy-specific seed
+				seed := int64(0xF10A0000) + int64(i+1)
+				finalRounds = append(finalRounds, botfleet.FinalRoundDef{
+					Strategy: botfleet.Strategy(strat),
+					Seed:     seed,
+					Label:    strat,
+				})
+			}
+		} else {
+			finalRounds = botfleet.DefaultFinalRounds
+		}
+
+		// Run finalization in background so the HTTP request doesn't timeout
+		go func() {
+			ctx := context.Background()
+			frc := botfleet.FinalRoundConfig{
+				ContestID:    contestID,
+				Rounds:       finalRounds,
+				BotCount:     body.BotCount,
+				RequestCount: body.RequestCount,
+				Duration:     time.Duration(body.DurationSecs) * time.Second,
+				Timeout:      2 * time.Second,
+				RedisClient:  redisClient,
+			}
+
+			// For each team, we would need their running sandbox target URL.
+			// In practice this comes from the sandbox service registry.
+			// For now we log the intent — the actual execution requires sandbox orchestration.
+			for _, teamName := range teams {
+				log.Printf("[Finalize] Would evaluate team %s for contest %s (requires sandbox target)", teamName, contestID)
+				// When sandbox URLs are available:
+				// result, err := botfleet.RunFinalRounds(ctx, frc, botfleet.FinalSubmission{...})
+				// Then persist: db.SaveFinalScore(...)
+			}
+
+			// Mark as completed
+			if err := db.UpdateContestPhase(ctx, contestID, "completed"); err != nil {
+				log.Printf("WARNING: failed to set contest phase to completed: %v", err)
+			}
+
+			// Broadcast updated leaderboard
+			if finalScores, err := db.GetContestFinalScores(ctx, contestID, 50); err == nil {
+				hub.Broadcast(ws.LeaderboardUpdate{
+					Type:    "contest_finalized",
+					Payload: finalScores,
+				})
+			}
+
+			_ = frc // suppress unused warning until sandbox URLs are wired
+			log.Printf("[Finalize] Finalization complete for contest %s", contestID)
+		}()
+
+		return c.JSON(fiber.Map{
+			"message":    "Finalization started",
+			"contest_id": contestID,
+			"teams":      len(teams),
+			"rounds":     len(botfleet.DefaultFinalRounds),
+		})
+	})
+
+	// --- Contest-specific leaderboard (returns live or final scores) ---
+	app.Get("/contests/:id/leaderboard", func(c *fiber.Ctx) error {
+		if db == nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"message": "database not available"})
+		}
+
+		contestID := c.Params("id")
+		limit, _ := strconv.Atoi(c.Query("limit", "50"))
+		if limit <= 0 || limit > 200 {
+			limit = 50
+		}
+
+		finalScores, liveScores, err := db.GetContestLeaderboard(c.Context(), contestID, limit)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "leaderboard query failed", "error": err.Error()})
+		}
+
+		if finalScores != nil {
+			return c.JSON(fiber.Map{
+				"type":        "final",
+				"contest_id":  contestID,
+				"leaderboard": finalScores,
+			})
+		}
+		return c.JSON(fiber.Map{
+			"type":        "live",
+			"contest_id":  contestID,
+			"leaderboard": liveScores,
+		})
+	})
+
+	// --- Post-contest final results ---
+	app.Get("/contests/:id/final-results", func(c *fiber.Ctx) error {
+		if db == nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"message": "database not available"})
+		}
+
+		contestID := c.Params("id")
+		limit, _ := strconv.Atoi(c.Query("limit", "50"))
+		if limit <= 0 || limit > 200 {
+			limit = 50
+		}
+
+		results, err := db.GetContestFinalScores(c.Context(), contestID, limit)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "final results query failed", "error": err.Error()})
+		}
+
+		return c.JSON(fiber.Map{
+			"contest_id": contestID,
+			"results":    results,
+		})
+	})
+
+	log.Println("Platform API running on port 3001")
+	log.Fatal(app.Listen(":3001"))
 }
