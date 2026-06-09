@@ -2,6 +2,225 @@ import { useState, useEffect } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 
+const gradeColors = {
+  S: { bg: 'linear-gradient(135deg, #fbbf24, #f59e0b)', color: '#78350f', glow: 'rgba(251,191,36,0.3)' },
+  A: { bg: 'linear-gradient(135deg, #34d399, #10b981)', color: '#064e3b', glow: 'rgba(52,211,153,0.3)' },
+  B: { bg: 'linear-gradient(135deg, #60a5fa, #3b82f6)', color: '#1e3a5f', glow: 'rgba(96,165,250,0.3)' },
+  C: { bg: 'linear-gradient(135deg, #a78bfa, #8b5cf6)', color: '#2e1065', glow: 'rgba(167,139,250,0.3)' },
+  F: { bg: 'linear-gradient(135deg, #f87171, #ef4444)', color: '#7f1d1d', glow: 'rgba(248,113,113,0.3)' },
+};
+
+function GradeBadge({ grade }) {
+  const style = gradeColors[grade] || gradeColors.F;
+  return (
+    <span
+      className="grade-badge"
+      style={{
+        background: style.bg,
+        color: style.color,
+        boxShadow: `0 4px 16px ${style.glow}`,
+        padding: '0.2rem 0.6rem',
+        borderRadius: '0.5rem',
+        fontWeight: '800',
+        fontSize: '0.8rem',
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        minWidth: '1.6rem',
+        height: '1.6rem',
+      }}
+    >
+      {grade}
+    </span>
+  );
+}
+
+function formatLatency(ms) {
+  if (ms == null) return '—';
+  if (ms < 1) return `${(ms * 1000).toFixed(0)}µs`;
+  if (ms < 100) return `${ms.toFixed(2)}ms`;
+  return `${ms.toFixed(0)}ms`;
+}
+
+function formatTPS(tps) {
+  if (tps == null) return '—';
+  if (tps >= 1000) return `${(tps / 1000).toFixed(1)}K`;
+  return tps.toFixed(0);
+}
+
+const strategyLabels = {
+  bbo_heavy: 'Common',
+  flash_crash: 'Flash Crash',
+  high_cancel: 'High Cancel',
+  wide_spread: 'Wide Spread',
+  market_maker: 'Market Maker',
+  iceberg: 'Iceberg',
+  momentum_burst: 'Momentum Burst',
+};
+
+function strategyLabel(strategy) {
+  return strategyLabels[strategy] || strategy || '—';
+}
+
+function ScoreBar({ label, value, max, color }) {
+  const pct = Math.min((value / max) * 100, 100);
+  return (
+    <div className="score-bar-container">
+      <div className="score-bar-label">
+        <span>{label}</span>
+        <span>{value.toFixed(1)}/{max}</span>
+      </div>
+      <div className="score-bar-track">
+        <div
+          className="score-bar-fill"
+          style={{ width: `${pct}%`, background: color }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function SubmissionDetail({ submission, onClose }) {
+  if (!submission) return null;
+  const displayName = (entry) => {
+    if (entry.system_name && entry.system_name.trim()) return entry.system_name;
+    return entry.submission_id?.slice(0, 18) || '—';
+  };
+  return (
+    <div className="detail-overlay" onClick={onClose}>
+      <article className="detail-card panel" onClick={e => e.stopPropagation()}>
+        <div className="detail-header">
+          <div>
+            <span className="section-tag">Submission Detail</span>
+            <h3>{displayName(submission)}</h3>
+            <span className="detail-strategy-tag">{strategyLabel(submission.strategy)}</span>
+          </div>
+          <button className="detail-close" onClick={onClose} aria-label="Close">✕</button>
+        </div>
+
+        <div className="detail-scores">
+          <div className="detail-total">
+            <GradeBadge grade={submission.grade} />
+            <div className="detail-total-num">
+              <strong>{submission.total_score?.toFixed(1) || '0.0'}</strong>
+              <span>/100</span>
+            </div>
+          </div>
+
+          <div className="detail-breakdown">
+            <ScoreBar label="Latency" value={submission.latency_score || 0} max={50} color="#3b82f6" />
+            <ScoreBar label="Throughput" value={submission.throughput_score || 0} max={30} color="#10b981" />
+            <ScoreBar label="Correctness" value={submission.correctness_score || 0} max={20} color="#f59e0b" />
+          </div>
+        </div>
+
+        <div className="detail-metrics">
+          <div className="metric-cell">
+            <span>P99 Latency</span>
+            <strong>{formatLatency(submission.p99_latency_ms)}</strong>
+          </div>
+          <div className="metric-cell">
+            <span>TPS</span>
+            <strong>{formatTPS(submission.tps)}</strong>
+          </div>
+          <div className="metric-cell">
+            <span>Orders</span>
+            <strong>{(submission.orders_processed || 0).toLocaleString()}</strong>
+          </div>
+          <div className="metric-cell">
+            <span>Crosses</span>
+            <strong className={submission.cross_events > 0 ? 'error-text' : ''}>
+              {submission.cross_events || 0}
+            </strong>
+          </div>
+          <div className="metric-cell">
+            <span>Strategy</span>
+            <strong>{strategyLabel(submission.strategy)}</strong>
+          </div>
+          <div className="metric-cell">
+            <span>Submitted</span>
+            <strong>{new Date(submission.submitted_at).toLocaleString()}</strong>
+          </div>
+        </div>
+      </article>
+    </div>
+  );
+}
+
+function HistoryModal({ history, systemName, onClose, onSelect }) {
+  return (
+    <div className="detail-overlay" onClick={onClose}>
+      <div className="detail-card panel" style={{ maxWidth: '52rem', width: '92%', maxHeight: '85vh', display: 'flex', flexDirection: 'column', padding: '2rem' }} onClick={e => e.stopPropagation()}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem', flexShrink: 0 }}>
+          <div style={{ textAlign: 'left' }}>
+            <span className="section-tag">Performance Archive</span>
+            <h2 style={{ fontSize: '1.5rem', margin: '0.2rem 0 0', letterSpacing: '-0.02em', color: 'var(--text-h)' }}>
+              Submission History
+            </h2>
+            <p style={{ margin: '0.2rem 0 0', fontSize: '0.85rem', color: 'var(--muted)' }}>
+              Showing runs for system "{systemName}"
+            </p>
+          </div>
+          <button className="detail-close" onClick={onClose} aria-label="Close">✕</button>
+        </div>
+
+        <div style={{ flex: 1, overflowY: 'auto', minHeight: 0, marginBottom: '0.5rem' }}>
+          {history.length === 0 ? (
+            <div style={{ padding: '3rem 1rem', textAlign: 'center', background: 'rgba(15, 23, 42, 0.02)', borderRadius: '1rem', border: '1px dashed rgba(148, 163, 184, 0.25)' }}>
+              <p style={{ color: 'var(--muted)', margin: 0, fontSize: '0.95rem' }}>No practice submissions found for "{systemName}".</p>
+            </div>
+          ) : (
+            <div className="leaderboard-table-wrap" style={{ border: '1px solid rgba(148, 163, 184, 0.15)', background: '#fff' }}>
+              <table className="leaderboard-table">
+                <thead>
+                  <tr>
+                    <th style={{ padding: '0.85rem 1rem' }}>Date</th>
+                    <th style={{ padding: '0.85rem 1rem' }}>Strategy</th>
+                    <th style={{ padding: '0.85rem 1rem' }}>Grade</th>
+                    <th style={{ padding: '0.85rem 1rem' }}>Score</th>
+                    <th style={{ padding: '0.85rem 1rem' }}>TPS</th>
+                    <th style={{ padding: '0.85rem 1rem' }}>P99 Latency</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {history.map(run => (
+                    <tr 
+                      key={run.submission_id} 
+                      className="lb-row" 
+                      onClick={() => onSelect(run)}
+                      style={{ cursor: 'pointer' }}
+                      title="Click to view details"
+                    >
+                      <td style={{ padding: '0.85rem 1rem', color: '#64748b', fontSize: '0.85rem' }}>
+                        {new Date(run.submitted_at).toLocaleDateString()} {new Date(run.submitted_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                      </td>
+                      <td className="strategy-cell" style={{ padding: '0.85rem 1rem' }}>
+                        {strategyLabel(run.strategy)}
+                      </td>
+                      <td style={{ padding: '0.6rem 1rem' }}>
+                        <GradeBadge grade={run.grade} />
+                      </td>
+                      <td className="score-cell" style={{ padding: '0.85rem 1rem' }}>
+                        {run.total_score?.toFixed(1)}
+                      </td>
+                      <td style={{ padding: '0.85rem 1rem', fontWeight: 600 }}>
+                        {formatTPS(run.tps)}
+                      </td>
+                      <td style={{ padding: '0.85rem 1rem', fontWeight: 600 }}>
+                        {formatLatency(run.p99_latency_ms)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function SubmitPage() {
   const { user, authHeaders } = useAuth();
   const languageExtensions = {
@@ -34,6 +253,7 @@ export default function SubmitPage() {
   const [history, setHistory] = useState([]);
   const [showHistory, setShowHistory] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(false);
+  const [selectedSubmission, setSelectedSubmission] = useState(null);
 
   // Auto-update systemName when user changes
   useEffect(() => {
@@ -145,7 +365,10 @@ export default function SubmitPage() {
       }
 
       if (!response.ok) {
-        throw new Error(result?.message || `Submission failed with status ${response.status}`);
+        if (result?.execution_result) {
+          setExecutionResult(result.execution_result);
+        }
+        throw new Error(result?.error || result?.message || `Submission failed with status ${response.status}`);
       }
 
       const sandboxExecution = result?.execution_result || null;
@@ -312,6 +535,7 @@ export default function SubmitPage() {
               required
               type="text"
               name="systemName"
+              value={formData.systemName}
               onChange={handleChange}
               placeholder="e.g., UltraFast-Matcher"
             />
@@ -406,6 +630,12 @@ export default function SubmitPage() {
                 <div className="result-row">
                   <span>Target</span>
                   <strong>{executionResult.target_url}</strong>
+                </div>
+              ) : null}
+              {executionResult.output ? (
+                <div className="result-output" style={{ marginTop: '0.5rem' }}>
+                  <span>Execution Output / Logs</span>
+                  <pre>{executionResult.output}</pre>
                 </div>
               ) : null}
               <button
@@ -534,49 +764,19 @@ export default function SubmitPage() {
       </section>
 
       {showHistory && (
-        <section className="submit-section panel" style={{ marginTop: '1.5rem' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-            <h2 style={{ fontSize: '1.2rem', margin: 0 }}>Submission History</h2>
-            <button 
-              className="button button-secondary" 
-              style={{ padding: '0.4rem 0.8rem', fontSize: '0.85rem' }}
-              onClick={() => setShowHistory(false)}
-            >
-              Close
-            </button>
-          </div>
-          
-          {history.length === 0 ? (
-            <p style={{ color: 'var(--muted)' }}>No practice submissions found for "{formData.systemName}".</p>
-          ) : (
-            <div style={{ overflowX: 'auto' }}>
-              <table style={{ width: '100%', textAlign: 'left', borderCollapse: 'collapse', fontSize: '0.9rem' }}>
-                <thead>
-                  <tr style={{ borderBottom: '1px solid var(--border)' }}>
-                    <th style={{ padding: '0.5rem' }}>Date</th>
-                    <th style={{ padding: '0.5rem' }}>Strategy</th>
-                    <th style={{ padding: '0.5rem' }}>Grade</th>
-                    <th style={{ padding: '0.5rem' }}>Score</th>
-                    <th style={{ padding: '0.5rem' }}>TPS</th>
-                    <th style={{ padding: '0.5rem' }}>Latency</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {history.map(run => (
-                    <tr key={run.submission_id} style={{ borderBottom: '1px solid var(--border)' }}>
-                      <td style={{ padding: '0.5rem', color: 'var(--muted)' }}>{new Date(run.submitted_at).toLocaleDateString()} {new Date(run.submitted_at).toLocaleTimeString()}</td>
-                      <td style={{ padding: '0.5rem' }}>{run.strategy}</td>
-                      <td style={{ padding: '0.5rem', fontWeight: 'bold' }}>{run.grade}</td>
-                      <td style={{ padding: '0.5rem' }}>{run.total_score?.toFixed(1)}</td>
-                      <td style={{ padding: '0.5rem' }}>{run.tps?.toFixed(0)}</td>
-                      <td style={{ padding: '0.5rem' }}>{run.p99_latency_ms?.toFixed(1)}ms</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </section>
+        <HistoryModal
+          history={history}
+          systemName={formData.systemName}
+          onClose={() => setShowHistory(false)}
+          onSelect={(run) => setSelectedSubmission(run)}
+        />
+      )}
+
+      {selectedSubmission && (
+        <SubmissionDetail
+          submission={selectedSubmission}
+          onClose={() => setSelectedSubmission(null)}
+        />
       )}
     </section>
   );

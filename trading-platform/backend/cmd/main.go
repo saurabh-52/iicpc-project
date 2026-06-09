@@ -2,13 +2,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math/big"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -182,6 +185,20 @@ func main() {
 		AllowHeaders: "Content-Type,Authorization",
 	}))
 
+	// Detect minikube IP if running locally
+	if os.Getenv("MINIKUBE_IP") == "" && !sandbox.InCluster() {
+		cmd := exec.Command("minikube", "ip")
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		if err := cmd.Run(); err == nil {
+			ip := strings.TrimSpace(out.String())
+			if ip != "" && net.ParseIP(ip) != nil {
+				os.Setenv("MINIKUBE_IP", ip)
+				log.Printf("Automatically detected Minikube IP: %s", ip)
+			}
+		}
+	}
+
 	// Ensure our temporary workspace exists
 	os.MkdirAll("./workspace", os.ModePerm)
 
@@ -199,18 +216,27 @@ func main() {
 		log.Printf("Redis connected at %s", redisAddr)
 	}
 
-	// --- Postgres (optional — scoring persistence is best-effort) ---
+	// --- Postgres (Required for authentication and scoring) ---
 	var db *store.Store
 	pgURL := os.Getenv("POSTGRES_URL")
 	if pgURL == "" {
 		pgURL = "postgres://user:password@127.0.0.1:5432/postgres?sslmode=disable"
 	}
-	dbConn, err := store.NewStore(context.Background(), pgURL)
-	if err != nil {
-		log.Printf("WARNING: PostgreSQL not available — leaderboard disabled: %v", err)
-	} else {
-		db = dbConn
-		log.Println("PostgreSQL connected and migrated")
+	
+	// Try to connect to PostgreSQL with retries
+	for i := 0; i < 10; i++ {
+		dbConn, err := store.NewStore(context.Background(), pgURL)
+		if err == nil {
+			db = dbConn
+			log.Println("PostgreSQL connected and migrated")
+			break
+		}
+		log.Printf("WARNING: PostgreSQL not available (attempt %d/10): %v", i+1, err)
+		time.Sleep(3 * time.Second)
+	}
+
+	if db == nil {
+		log.Println("ERROR: PostgreSQL not available after retries. Endpoints requiring db will return 'database not available'.")
 	}
 
 	// Health check endpoint for Kubernetes probes
@@ -536,6 +562,13 @@ func main() {
 			response := fiber.Map{
 				"message": "failed to execute submission",
 				"error":   executionErr.Error(),
+				"execution_result": fiber.Map{
+					"pod_id":       executionResult.PodID,
+					"service_name": executionResult.ServiceName,
+					"phase":        executionResult.Phase,
+					"output":       executionResult.Output,
+					"node_port":    executionResult.NodePort,
+				},
 				"form_data": fiber.Map{
 					"language":             language,
 					"port":                 port,
@@ -657,26 +690,58 @@ func main() {
 				scoreCtx, scoreCancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer scoreCancel()
 				events, consumeErr := telemetry.ConsumeAllForSubmission(scoreCtx, redisClient, submissionID)
-				if consumeErr == nil && len(events) > 0 {
-					perfMetrics := scorer.ComputeMetrics(submissionID, events)
-					valResult := validator.RunValidatorFromEvents(submissionID, events)
-					sc := scorer.ComputeScore(perfMetrics, valResult)
-					rr.Score = &sc
+				
+				var sc scorer.Score
+				var perfMetrics scorer.PerformanceMetrics
+				var valResult validator.ValidationResult
+				hasScored := false
 
-					if db != nil {
-						// Extract user_id from the request context (set by auth middleware)
-						submitUserID := ""
-						if uid, ok := c.Locals("user_id").(string); ok {
-							submitUserID = uid
-						}
-						sr := store.NewSubmissionResultWithMode(
-							submissionID, systemName, string(strategy), "", submitUserID,
-							sc, perfMetrics, valResult,
-							string(judgingMode), req.ContestID, nil, seed,
-						)
-						if storeErr := db.CreateSubmissionResult(scoreCtx, sr); storeErr != nil {
-							log.Printf("WARNING: failed to persist scoring result for %s: %v", strategy, storeErr)
-						}
+				if consumeErr == nil && len(events) > 0 {
+					perfMetrics = scorer.ComputeMetrics(submissionID, events)
+					valResult = validator.RunValidatorFromEvents(submissionID, events)
+					sc = scorer.ComputeScore(perfMetrics, valResult)
+					rr.Score = &sc
+					hasScored = true
+				} else {
+					// Fallback to botfleet Summary metrics if telemetry events are missing
+					sc = scorer.Score{
+						Grade: "F",
+					}
+					perfMetrics = scorer.PerformanceMetrics{
+						SubmissionID:  submissionID,
+						TotalRequests: metrics.Requests,
+						Successes:     metrics.Successes,
+						Failures:      metrics.Failures,
+						TPS:           metrics.RequestsPerSecond,
+						MinLatencyMs:  metrics.MinLatencyMs,
+						AvgLatencyMs:  metrics.AverageLatencyMs,
+						P50LatencyMs:  metrics.P50LatencyMs,
+						P90LatencyMs:  metrics.P90LatencyMs,
+						P99LatencyMs:  metrics.P99LatencyMs,
+						MaxLatencyMs:  metrics.MaxLatencyMs,
+						StdDevMs:      metrics.StdDevMs,
+					}
+					if metrics.Successes > 0 {
+						// If there are successes, let's still compute a rough score
+						sc = scorer.ComputeScore(perfMetrics, valResult)
+					}
+					rr.Score = &sc
+					hasScored = true
+				}
+
+				if hasScored && db != nil {
+					// Extract user_id from the request context (set by auth middleware)
+					submitUserID := ""
+					if uid, ok := c.Locals("user_id").(string); ok {
+						submitUserID = uid
+					}
+					sr := store.NewSubmissionResultWithMode(
+						submissionID, systemName, string(strategy), "", submitUserID,
+						sc, perfMetrics, valResult,
+						string(judgingMode), req.ContestID, nil, seed,
+					)
+					if storeErr := db.CreateSubmissionResult(scoreCtx, sr); storeErr != nil {
+						log.Printf("WARNING: failed to persist scoring result for %s: %v", strategy, storeErr)
 					}
 				}
 			}

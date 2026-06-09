@@ -3395,3 +3395,8 @@ select:focus-visible {
     display: none;
   }
 }
+
+.submit-section {
+  grid-column: 1 / -1;
+}
+

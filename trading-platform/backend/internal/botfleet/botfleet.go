@@ -284,11 +284,18 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 		}(botID)
 	}
 
+	workersDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(workersDone)
+	}()
+
 	if cfg.Duration > 0 {
 		timer := time.NewTimer(cfg.Duration)
 		select {
 		case <-timer.C:
 			cancel()
+		case <-workersDone:
 		case <-ctx.Done():
 		}
 		if !timer.Stop() {
@@ -299,12 +306,18 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 		}
 	} else {
 		for cfg.Requests > 0 && atomic.LoadInt64(&sent) < int64(cfg.Requests) {
-			time.Sleep(10 * time.Millisecond)
+			select {
+			case <-workersDone:
+				goto done
+			default:
+				time.Sleep(10 * time.Millisecond)
+			}
 		}
+	done:
 		cancel()
 	}
 
-	wg.Wait()
+	<-workersDone
 	elapsed := time.Since(start)
 	return rec.summary(cfg, elapsed), nil
 }
