@@ -180,6 +180,13 @@ ALTER TABLE contest_registrations ADD COLUMN IF NOT EXISTS user_id TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_submission_results_user_id
 ON submission_results (user_id, submitted_at DESC);
+
+-- Track who created/published each contest
+ALTER TABLE contests ADD COLUMN IF NOT EXISTS created_by TEXT NOT NULL DEFAULT '';
+
+-- Index for looking up a user's contest registrations
+CREATE INDEX IF NOT EXISTS idx_contest_registrations_user_id
+ON contest_registrations (user_id, contest_id);
 `
 
 // NewSubmissionResult builds a SubmissionResult from scoring outputs.

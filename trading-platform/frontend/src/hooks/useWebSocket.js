@@ -8,6 +8,7 @@ export default function useWebSocket() {
   const [leaderboard, setLeaderboard] = useState([]);
   const [connected, setConnected] = useState(false);
   const [updateTrigger, setUpdateTrigger] = useState(0);
+  const [finalizationProgress, setFinalizationProgress] = useState(null);
   const wsRef = useRef(null);
   const reconnectTimeout = useRef(null);
   const isUnmounted = useRef(false);
@@ -28,6 +29,14 @@ export default function useWebSocket() {
         const data = JSON.parse(event.data);
         if (data.type === 'leaderboard_update' && Array.isArray(data.payload)) {
           setLeaderboard(data.payload);
+          setUpdateTrigger(prev => prev + 1);
+        } else if (data.type === 'finalization_progress') {
+          setFinalizationProgress({
+            contestId: data.contest_id,
+            progress: data.progress,
+          });
+          setUpdateTrigger(prev => prev + 1);
+        } else if (data.type === 'contest_finalized') {
           setUpdateTrigger(prev => prev + 1);
         }
       } catch {
@@ -59,5 +68,5 @@ export default function useWebSocket() {
     };
   }, [connect]);
 
-  return { leaderboard, connected, updateTrigger };
+  return { leaderboard, connected, updateTrigger, finalizationProgress };
 }

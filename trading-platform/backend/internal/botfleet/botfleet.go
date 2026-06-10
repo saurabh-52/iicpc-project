@@ -232,6 +232,9 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 	}
 
 	start := time.Now()
+	warmupDuration := 2 * time.Second
+	warmupEnd := start.Add(warmupDuration)
+
 	rec := &recorder{}
 	var sent int64
 	var wg sync.WaitGroup
@@ -275,11 +278,11 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 
 			switch cfg.Protocol {
 			case ProtocolTCP:
-				runTCPWorker(ctx, cfg, botID, &seq, rng, rec, &sent)
+				runTCPWorker(ctx, cfg, botID, &seq, rng, rec, &sent, warmupEnd)
 			case ProtocolFIX:
-				runFIXWorker(ctx, cfg, botID, &seq, rng, rec, &sent)
+				runFIXWorker(ctx, cfg, botID, &seq, rng, rec, &sent, warmupEnd)
 			default:
-				runHTTPWorker(ctx, cfg, botID, &seq, rng, rec, &sent)
+				runHTTPWorker(ctx, cfg, botID, &seq, rng, rec, &sent, warmupEnd)
 			}
 		}(botID)
 	}
@@ -291,7 +294,7 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 	}()
 
 	if cfg.Duration > 0 {
-		timer := time.NewTimer(cfg.Duration)
+		timer := time.NewTimer(cfg.Duration + warmupDuration)
 		select {
 		case <-timer.C:
 			cancel()
@@ -318,11 +321,14 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 	}
 
 	<-workersDone
-	elapsed := time.Since(start)
+	elapsed := time.Since(warmupEnd)
+	if elapsed < 0 {
+		elapsed = 0
+	}
 	return rec.summary(cfg, elapsed), nil
 }
 
-func runHTTPWorker(ctx context.Context, cfg Config, botID int, seq *int, rng *rand.Rand, rec *recorder, sent *int64) {
+func runHTTPWorker(ctx context.Context, cfg Config, botID int, seq *int, rng *rand.Rand, rec *recorder, sent *int64, warmupEnd time.Time) {
 	transport := &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 100,
@@ -334,7 +340,7 @@ func runHTTPWorker(ctx context.Context, cfg Config, botID int, seq *int, rng *ra
 		Transport: transport,
 	}
 	for {
-		if !claimWork(ctx, cfg, sent) {
+		if !claimWork(ctx, cfg, sent, warmupEnd) {
 			return
 		}
 		*seq++
@@ -365,33 +371,35 @@ func runHTTPWorker(ctx context.Context, cfg Config, botID int, seq *int, rng *ra
 		_ = resp.Body.Close()
 		engineOut := string(bodyBuf[:n])
 
-		if resp.StatusCode >= 400 {
-			rec.addError(latency, fmt.Sprintf("http_%d", resp.StatusCode))
-		} else {
-			rec.add(latency, true)
-		}
+		if started.After(warmupEnd) {
+			if resp.StatusCode >= 400 {
+				rec.addError(latency, fmt.Sprintf("http_%d", resp.StatusCode))
+			} else {
+				rec.add(latency, true)
+			}
 
-		action := order.Action
-		if action == "" {
-			action = "NEW"
+			action := order.Action
+			if action == "" {
+				action = "NEW"
+			}
+			publishAsync(cfg.TelemetryClient, telemetry.TelemetryEvent{
+				SubmissionID: cfg.SubmissionID,
+				BotID:        botID,
+				Sequence:     *seq,
+				Action:       action,
+				Side:         order.Side,
+				Price:        order.Price,
+				Quantity:     order.Quantity,
+				StatusCode:   resp.StatusCode,
+				LatencyMs:    float64(latency.Nanoseconds()) / 1e6,
+				Timestamp:    time.Now().UTC(),
+				EngineOutput: engineOut,
+			})
 		}
-		publishAsync(cfg.TelemetryClient, telemetry.TelemetryEvent{
-			SubmissionID: cfg.SubmissionID,
-			BotID:        botID,
-			Sequence:     *seq,
-			Action:       action,
-			Side:         order.Side,
-			Price:        order.Price,
-			Quantity:     order.Quantity,
-			StatusCode:   resp.StatusCode,
-			LatencyMs:    float64(latency.Nanoseconds()) / 1e6,
-			Timestamp:    time.Now().UTC(),
-			EngineOutput: engineOut,
-		})
 	}
 }
 
-func runTCPWorker(ctx context.Context, cfg Config, botID int, seq *int, rng *rand.Rand, rec *recorder, sent *int64) {
+func runTCPWorker(ctx context.Context, cfg Config, botID int, seq *int, rng *rand.Rand, rec *recorder, sent *int64, warmupEnd time.Time) {
 	dialer := net.Dialer{Timeout: cfg.Timeout}
 	conn, err := dialer.DialContext(ctx, "tcp", cfg.Target)
 	if err != nil {
@@ -403,7 +411,7 @@ func runTCPWorker(ctx context.Context, cfg Config, botID int, seq *int, rng *ran
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 	for {
-		if !claimWork(ctx, cfg, sent) {
+		if !claimWork(ctx, cfg, sent, warmupEnd) {
 			return
 		}
 		*seq++
@@ -436,31 +444,33 @@ func runTCPWorker(ctx context.Context, cfg Config, botID int, seq *int, rng *ran
 			}
 		}
 
-		rec.add(time.Since(started), true)
+		if started.After(warmupEnd) {
+			rec.add(time.Since(started), true)
 
-		action := order.Action
-		if action == "" {
-			action = "NEW"
+			action := order.Action
+			if action == "" {
+				action = "NEW"
+			}
+			publishAsync(cfg.TelemetryClient, telemetry.TelemetryEvent{
+				SubmissionID: cfg.SubmissionID,
+				BotID:        botID,
+				Sequence:     *seq,
+				Action:       action,
+				Side:         order.Side,
+				Price:        order.Price,
+				Quantity:     order.Quantity,
+				StatusCode:   200,
+				LatencyMs:    float64(time.Since(started).Nanoseconds()) / 1e6,
+				Timestamp:    time.Now().UTC(),
+			})
 		}
-		publishAsync(cfg.TelemetryClient, telemetry.TelemetryEvent{
-			SubmissionID: cfg.SubmissionID,
-			BotID:        botID,
-			Sequence:     *seq,
-			Action:       action,
-			Side:         order.Side,
-			Price:        order.Price,
-			Quantity:     order.Quantity,
-			StatusCode:   200,
-			LatencyMs:    float64(time.Since(started).Nanoseconds()) / 1e6,
-			Timestamp:    time.Now().UTC(),
-		})
 	}
 }
 
 // runFIXWorker sends orders in a simplified FIX-like wire format:
 // pipe-delimited key=value pairs terminated by newline.
 // e.g. "35=D|49=BOT0|54=1|55=SYM|44=100.50|38=25|10=000|\n"
-func runFIXWorker(ctx context.Context, cfg Config, botID int, seq *int, rng *rand.Rand, rec *recorder, sent *int64) {
+func runFIXWorker(ctx context.Context, cfg Config, botID int, seq *int, rng *rand.Rand, rec *recorder, sent *int64, warmupEnd time.Time) {
 	dialer := net.Dialer{Timeout: cfg.Timeout}
 	conn, err := dialer.DialContext(ctx, "tcp", cfg.Target)
 	if err != nil {
@@ -472,7 +482,7 @@ func runFIXWorker(ctx context.Context, cfg Config, botID int, seq *int, rng *ran
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 	for {
-		if !claimWork(ctx, cfg, sent) {
+		if !claimWork(ctx, cfg, sent, warmupEnd) {
 			return
 		}
 		*seq++
@@ -505,24 +515,26 @@ func runFIXWorker(ctx context.Context, cfg Config, botID int, seq *int, rng *ran
 			}
 		}
 
-		rec.add(time.Since(started), true)
+		if started.After(warmupEnd) {
+			rec.add(time.Since(started), true)
 
-		action := order.Action
-		if action == "" {
-			action = "NEW"
+			action := order.Action
+			if action == "" {
+				action = "NEW"
+			}
+			publishAsync(cfg.TelemetryClient, telemetry.TelemetryEvent{
+				SubmissionID: cfg.SubmissionID,
+				BotID:        botID,
+				Sequence:     *seq,
+				Action:       action,
+				Side:         order.Side,
+				Price:        order.Price,
+				Quantity:     order.Quantity,
+				StatusCode:   200,
+				LatencyMs:    float64(time.Since(started).Nanoseconds()) / 1e6,
+				Timestamp:    time.Now().UTC(),
+			})
 		}
-		publishAsync(cfg.TelemetryClient, telemetry.TelemetryEvent{
-			SubmissionID: cfg.SubmissionID,
-			BotID:        botID,
-			Sequence:     *seq,
-			Action:       action,
-			Side:         order.Side,
-			Price:        order.Price,
-			Quantity:     order.Quantity,
-			StatusCode:   200,
-			LatencyMs:    float64(time.Since(started).Nanoseconds()) / 1e6,
-			Timestamp:    time.Now().UTC(),
-		})
 	}
 }
 
@@ -542,9 +554,12 @@ func orderToFIX(o Order) string {
 		msgType, o.BotID, o.Sequence, side, o.Price, o.Quantity)
 }
 
-func claimWork(ctx context.Context, cfg Config, sent *int64) bool {
+func claimWork(ctx context.Context, cfg Config, sent *int64, warmupEnd time.Time) bool {
 	if ctx.Err() != nil {
 		return false
+	}
+	if time.Now().Before(warmupEnd) {
+		return true
 	}
 	if cfg.Requests <= 0 {
 		return true

@@ -100,40 +100,64 @@ function SubmissionDetail({ submission, onClose }) {
           </div>
 
           <div className="detail-breakdown">
-            <ScoreBar label="Latency" value={submission.latency_score} max={50} color="#3b82f6" />
-            <ScoreBar label="Throughput" value={submission.throughput_score} max={30} color="#10b981" />
-            <ScoreBar label="Correctness" value={submission.correctness_score} max={20} color="#f59e0b" />
+            {submission.judging_mode === 'contest_final' ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', flex: 1 }}>
+                <strong style={{ fontSize: '0.85rem', color: 'var(--text-dim)' }}>Round Scores</strong>
+                {(submission.round_scores || []).map((rs, i) => (
+                  <ScoreBar key={i} label={rs.label} value={rs.score} max={100} color="#8b5cf6" />
+                ))}
+              </div>
+            ) : (
+              <>
+                <ScoreBar label="Latency" value={submission.latency_score} max={50} color="#3b82f6" />
+                <ScoreBar label="Throughput" value={submission.throughput_score} max={30} color="#10b981" />
+                <ScoreBar label="Correctness" value={submission.correctness_score} max={20} color="#f59e0b" />
+              </>
+            )}
           </div>
         </div>
 
-        <div className="detail-metrics">
-          <div className="metric-cell">
-            <span>P99 Latency</span>
-            <strong>{formatLatency(submission.p99_latency_ms)}</strong>
+        {submission.judging_mode === 'contest_final' ? (
+          <div className="detail-metrics" style={{ gridTemplateColumns: '1fr 1fr' }}>
+            <div className="metric-cell">
+              <span>Strategy</span>
+              <strong>{strategyLabel(submission.strategy)}</strong>
+            </div>
+            <div className="metric-cell">
+              <span>Finalized At</span>
+              <strong>{new Date(submission.submitted_at).toLocaleString()}</strong>
+            </div>
           </div>
-          <div className="metric-cell">
-            <span>TPS</span>
-            <strong>{formatTPS(submission.tps)}</strong>
+        ) : (
+          <div className="detail-metrics">
+            <div className="metric-cell">
+              <span>P99 Latency</span>
+              <strong>{formatLatency(submission.p99_latency_ms)}</strong>
+            </div>
+            <div className="metric-cell">
+              <span>TPS</span>
+              <strong>{formatTPS(submission.tps)}</strong>
+            </div>
+            <div className="metric-cell">
+              <span>Orders</span>
+              <strong>{(submission.orders_processed || 0).toLocaleString()}</strong>
+            </div>
+            <div className="metric-cell">
+              <span>Crosses</span>
+              <strong className={submission.cross_events > 0 ? 'error-text' : ''}>
+                {submission.cross_events || 0}
+              </strong>
+            </div>
+            <div className="metric-cell">
+              <span>Strategy</span>
+              <strong>{strategyLabel(submission.strategy)}</strong>
+            </div>
+            <div className="metric-cell">
+              <span>Submitted</span>
+              <strong>{new Date(submission.submitted_at).toLocaleString()}</strong>
+            </div>
           </div>
-          <div className="metric-cell">
-            <span>Orders</span>
-            <strong>{(submission.orders_processed || 0).toLocaleString()}</strong>
-          </div>
-          <div className="metric-cell">
-            <span>Crosses</span>
-            <strong className={submission.cross_events > 0 ? 'error-text' : ''}>
-              {submission.cross_events || 0}
-            </strong>
-          </div>
-          <div className="metric-cell">
-            <span>Strategy</span>
-            <strong>{strategyLabel(submission.strategy)}</strong>
-          </div>
-          <div className="metric-cell">
-            <span>Submitted</span>
-            <strong>{new Date(submission.submitted_at).toLocaleString()}</strong>
-          </div>
-        </div>
+        )}
       </article>
     </div>
   );
@@ -169,7 +193,27 @@ export default function Leaderboard() {
         return res.json();
       })
       .then(data => {
-        setEntries(data.leaderboard || []);
+        let fetchedEntries = data.leaderboard || [];
+        if (isContestMode && data.type === 'final') {
+          fetchedEntries = fetchedEntries.map(e => ({
+            ...e,
+            judging_mode: 'contest_final',
+            total_score: e.avg_score || 0,
+            grade: e.final_grade || 'F',
+            submission_id: `final-${e.system_name}`,
+            latency_score: 0,
+            throughput_score: 0,
+            correctness_score: 0,
+            p99_latency_ms: 0,
+            tps: 0,
+            cross_events: 0,
+            orders_processed: 0,
+            strategy: 'Combined Final',
+            submitted_at: e.finalized_at,
+            round_scores: e.round_scores,
+          }));
+        }
+        setEntries(fetchedEntries);
         if (isContestMode && data.type) {
           setModeFilter(data.type === 'final' ? 'contest_final' : 'contest_live');
         }
@@ -297,9 +341,11 @@ export default function Leaderboard() {
           <div className="empty-icon">🏁</div>
           <h3>No submissions yet</h3>
           <p>
-            {activeStrategy
-              ? `No submissions found for ${strategyLabel(activeStrategy)}. Try another strategy or submit an engine.`
-              : 'Submit a trading engine to see it ranked here.'}
+            {isContestMode
+              ? 'No submissions found for this contest yet.'
+              : activeStrategy
+                ? `No submissions found for ${strategyLabel(activeStrategy)}. Try another strategy or submit an engine.`
+                : 'Submit a trading engine to see it ranked here.'}
           </p>
         </div>
       ) : (

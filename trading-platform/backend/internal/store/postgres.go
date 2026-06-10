@@ -358,6 +358,7 @@ func (s *Store) PublishContest(
 	strategy string,
 	finalStrategies []string,
 	problems []ProblemData,
+	createdBy string,
 ) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -371,8 +372,8 @@ func (s *Store) PublishContest(
 
 	// Insert or update contest
 	const qContest = `
-INSERT INTO contests (id, name, description, visibility, code, start_time, duration_minutes, registration_deadline, strategy, final_strategies)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+INSERT INTO contests (id, name, description, visibility, code, start_time, duration_minutes, registration_deadline, strategy, final_strategies, created_by)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 ON CONFLICT (id) DO UPDATE SET
 	name = EXCLUDED.name,
 	description = EXCLUDED.description,
@@ -382,9 +383,10 @@ ON CONFLICT (id) DO UPDATE SET
 	duration_minutes = EXCLUDED.duration_minutes,
 	registration_deadline = EXCLUDED.registration_deadline,
 	strategy = EXCLUDED.strategy,
-	final_strategies = EXCLUDED.final_strategies
+	final_strategies = EXCLUDED.final_strategies,
+	created_by = EXCLUDED.created_by
 `
-	_, err = tx.Exec(ctx, qContest, contestID, name, description, visibility, code, startTime, durationMinutes, registrationDeadline, strategy, finalStrategies)
+	_, err = tx.Exec(ctx, qContest, contestID, name, description, visibility, code, startTime, durationMinutes, registrationDeadline, strategy, finalStrategies, createdBy)
 	if err != nil {
 		return fmt.Errorf("publish_contest: failed to insert contest: %w", err)
 	}
@@ -441,12 +443,15 @@ type Contest struct {
 	Participants         int        `json:"participants"`
 	Strategy             string     `json:"strategy"`
 	FinalStrategies      []string   `json:"finalStrategies"`
+	CreatedBy            string     `json:"createdBy"`
+	Phase                string     `json:"phase"`
 }
 
 // GetContests retrieves all contests from the database.
+// The code field is intentionally excluded from the list query to avoid leaking private contest codes.
 func (s *Store) GetContests(ctx context.Context) ([]Contest, error) {
 	const q = `
-SELECT c.id, c.name, c.description, c.visibility, c.code, c.start_time, c.duration_minutes, c.registration_deadline, c.created_at, c.strategy, c.final_strategies,
+SELECT c.id, c.name, c.description, c.visibility, c.start_time, c.duration_minutes, c.registration_deadline, c.created_at, c.strategy, c.final_strategies, c.created_by, c.phase,
        (SELECT COUNT(*)::int FROM contest_registrations r WHERE r.contest_id = c.id) AS participants
 FROM contests c
 ORDER BY c.start_time ASC
@@ -461,17 +466,19 @@ ORDER BY c.start_time ASC
 	for rows.Next() {
 		var c Contest
 		if err := rows.Scan(
-			&c.ID, &c.Name, &c.Description, &c.Visibility, &c.Code, &c.StartTime, &c.DurationMinutes, &c.RegistrationDeadline, &c.CreatedAt, &c.Strategy, &c.FinalStrategies, &c.Participants,
+			&c.ID, &c.Name, &c.Description, &c.Visibility, &c.StartTime, &c.DurationMinutes, &c.RegistrationDeadline, &c.CreatedAt, &c.Strategy, &c.FinalStrategies, &c.CreatedBy, &c.Phase, &c.Participants,
 		); err != nil {
 			return nil, err
 		}
+		// Don't expose the code in the listing
+		c.Code = ""
 		results = append(results, c)
 	}
 	return results, rows.Err()
 }
 
-// RegisterSystemForContest registers a system/team for a contest.
-func (s *Store) RegisterSystemForContest(ctx context.Context, contestID string, systemName string, code string) error {
+// RegisterSystemForContest registers a system/team for a contest, linked to a user account.
+func (s *Store) RegisterSystemForContest(ctx context.Context, contestID string, systemName string, code string, userID string) error {
 	// First, check if the contest exists and is private, if so, verify the code
 	var visibility, expectedCode string
 	err := s.pool.QueryRow(ctx, "SELECT visibility, code FROM contests WHERE id = $1", contestID).Scan(&visibility, &expectedCode)
@@ -488,13 +495,13 @@ func (s *Store) RegisterSystemForContest(ctx context.Context, contestID string, 
 		}
 	}
 
-	// Insert registration
+	// Insert registration with user linkage
 	const q = `
-INSERT INTO contest_registrations (contest_id, system_name, registered_at)
-VALUES ($1, $2, NOW())
-ON CONFLICT (contest_id, system_name) DO NOTHING
+INSERT INTO contest_registrations (contest_id, system_name, registered_at, user_id)
+VALUES ($1, $2, NOW(), $3)
+ON CONFLICT (contest_id, system_name) DO UPDATE SET user_id = EXCLUDED.user_id
 `
-	_, err = s.pool.Exec(ctx, q, contestID, systemName)
+	_, err = s.pool.Exec(ctx, q, contestID, systemName, userID)
 	return err
 }
 
@@ -527,13 +534,19 @@ func (s *Store) GetContestLeaderboard(ctx context.Context, contestID string, lim
 	}
 
 	// Fall back to live submission results for this contest
+	// Fall back to live submission results for this contest, fetching only the latest submission per system
 	const q = `
-SELECT submission_id, system_name, strategy, language, submitted_at, total_score, latency_score,
-       throughput_score, correctness_score, grade, p99_latency_ms, tps,
-       cross_events, orders_processed, raw_metrics, raw_validation,
-       judging_mode, COALESCE(contest_id, ''), final_round, seed_used
-FROM submission_results
-WHERE contest_id = $1 AND judging_mode = 'contest_live'
+WITH LatestSubmissions AS (
+    SELECT DISTINCT ON (system_name)
+           submission_id, system_name, strategy, language, submitted_at, total_score, latency_score,
+           throughput_score, correctness_score, grade, p99_latency_ms, tps,
+           cross_events, orders_processed, raw_metrics, raw_validation,
+           judging_mode, COALESCE(contest_id, '') AS c_id, final_round, seed_used
+    FROM submission_results
+    WHERE contest_id = $1 AND judging_mode = 'contest_live'
+    ORDER BY system_name, submitted_at DESC
+)
+SELECT * FROM LatestSubmissions
 ORDER BY total_score DESC
 LIMIT $2
 `
@@ -615,16 +628,73 @@ LIMIT $2
 // GetContest returns a single contest by ID.
 func (s *Store) GetContest(ctx context.Context, contestID string) (Contest, error) {
 	const q = `
-SELECT c.id, c.name, c.description, c.visibility, c.code, c.start_time, c.duration_minutes, c.registration_deadline, c.created_at, c.strategy, c.final_strategies,
+SELECT c.id, c.name, c.description, c.visibility, c.code, c.start_time, c.duration_minutes, c.registration_deadline, c.created_at, c.strategy, c.final_strategies, c.created_by, c.phase,
        (SELECT COUNT(*)::int FROM contest_registrations r WHERE r.contest_id = c.id) AS participants
 FROM contests c
 WHERE c.id = $1
 `
 	var c Contest
 	err := s.pool.QueryRow(ctx, q, contestID).Scan(
-		&c.ID, &c.Name, &c.Description, &c.Visibility, &c.Code, &c.StartTime, &c.DurationMinutes, &c.RegistrationDeadline, &c.CreatedAt, &c.Strategy, &c.FinalStrategies, &c.Participants,
+		&c.ID, &c.Name, &c.Description, &c.Visibility, &c.Code, &c.StartTime, &c.DurationMinutes, &c.RegistrationDeadline, &c.CreatedAt, &c.Strategy, &c.FinalStrategies, &c.CreatedBy, &c.Phase, &c.Participants,
 	)
 	return c, err
+}
+
+// GetContestProblems returns all problems for a given contest.
+func (s *Store) GetContestProblems(ctx context.Context, contestID string) ([]ProblemData, error) {
+	const q = `
+SELECT id, code, title, statement, time_limit, memory_limit,
+       sample_strategies, sample_bot_files, sample_show_custom, sample_target_injection, sample_protocol, sample_telemetry_format,
+       hidden_strategies, hidden_bot_files, hidden_show_custom, hidden_target_injection, hidden_protocol, hidden_telemetry_format
+FROM problems
+WHERE contest_id = $1
+ORDER BY sequence ASC
+`
+	rows, err := s.pool.Query(ctx, q, contestID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var problems []ProblemData
+	for rows.Next() {
+		var p ProblemData
+		if err := rows.Scan(
+			&p.ID, &p.Code, &p.Title, &p.Statement, &p.TimeLimit, &p.MemoryLimit,
+			&p.SampleStrategies, &p.SampleBotFilesJSON, &p.SampleShowCustom, &p.SampleTargetInjection, &p.SampleProtocol, &p.SampleTelemetryFormat,
+			&p.HiddenStrategies, &p.HiddenBotFilesJSON, &p.HiddenShowCustom, &p.HiddenTargetInjection, &p.HiddenProtocol, &p.HiddenTelemetryFormat,
+		); err != nil {
+			return nil, err
+		}
+		problems = append(problems, p)
+	}
+	return problems, rows.Err()
+}
+
+// DeleteContest deletes a contest and all associated data (via CASCADE).
+func (s *Store) DeleteContest(ctx context.Context, contestID string) error {
+	const q = `DELETE FROM contests WHERE id = $1`
+	_, err := s.pool.Exec(ctx, q, contestID)
+	return err
+}
+
+// GetUserRegistrations returns the list of contest IDs that a user is registered for.
+func (s *Store) GetUserRegistrations(ctx context.Context, userID string) ([]string, error) {
+	rows, err := s.pool.Query(ctx, "SELECT contest_id FROM contest_registrations WHERE user_id = $1", userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 // ─── User Methods ─────────────────────────────────────────────────────────────

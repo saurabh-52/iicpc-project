@@ -86,6 +86,13 @@ type LeaderboardUpdate struct {
 	Payload interface{} `json:"payload"` // []store.SubmissionResult
 }
 
+// FinalizationProgressUpdate is the JSON payload broadcast to clients for contest finalization.
+type FinalizationProgressUpdate struct {
+	Type     string `json:"type"`       // "finalization_progress"
+	Contest  string `json:"contest_id"` // Contest ID
+	Progress int    `json:"progress"`   // Progress percentage 0-100
+}
+
 // HandleConnection runs the WebSocket read loop for a single connection.
 // It keeps the connection alive until the client disconnects.
 func HandleConnection(hub *Hub, c *websocket.Conn) {
