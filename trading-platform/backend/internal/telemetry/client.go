@@ -52,6 +52,26 @@ func PublishEvent(ctx context.Context, client *redis.Client, event TelemetryEven
 	}).Err()
 }
 
+// PublishEventsBatch writes multiple TelemetryEvents to the Redis Stream via a Pipeline.
+// This significantly reduces connection overhead and drops when dealing with high TPS.
+func PublishEventsBatch(ctx context.Context, client *redis.Client, events []TelemetryEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	pipe := client.Pipeline()
+	for _, event := range events {
+		pipe.XAdd(ctx, &redis.XAddArgs{
+			Stream: Stream,
+			MaxLen: 100_000,
+			Approx: true,
+			ID:     "*",
+			Values: event.ToMap(),
+		})
+	}
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
 // ConsumeEvents reads up to count events starting AFTER lastID using XRANGE
 // (always non-blocking — returns immediately even on an empty stream).
 // Pass "0" as lastID to start from the beginning of the stream.
@@ -107,3 +127,11 @@ func ConsumeAllForSubmission(ctx context.Context, client *redis.Client, submissi
 	}
 	return all, nil
 }
+
+// TrimStream removes all entries from the telemetry Redis Stream.
+// Call this after contest finalization to prevent stale events from
+// accumulating and degrading performance of subsequent ConsumeAllForSubmission calls.
+func TrimStream(ctx context.Context, client *redis.Client) error {
+	return client.XTrimMaxLen(ctx, Stream, 0).Err()
+}
+

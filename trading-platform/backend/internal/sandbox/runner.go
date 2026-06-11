@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -344,13 +345,18 @@ func getPodLogs(ctx context.Context, clientset *kubernetes.Clientset, namespace 
 // cleanupOldSandboxes removes all existing sandbox pods, services, and configmaps
 // in the namespace.  Best-effort: errors are logged but don't block new sandbox creation.
 func cleanupOldSandboxes(ctx context.Context, clientset *kubernetes.Clientset, namespace string) {
+	gracePeriod := int64(0)
+	deleteOptions := metav1.DeleteOptions{
+		GracePeriodSeconds: &gracePeriod,
+	}
+
 	// Delete all pods with the sandbox label
 	podList, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: "app=trading-sandbox",
 	})
 	if err == nil {
 		for _, pod := range podList.Items {
-			_ = clientset.CoreV1().Pods(namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
+			_ = clientset.CoreV1().Pods(namespace).Delete(ctx, pod.Name, deleteOptions)
 			fmt.Printf("Auto-cleanup: deleted old pod %s\n", pod.Name)
 		}
 	}
@@ -396,6 +402,54 @@ func CleanupAllSandboxes(ctx context.Context) error {
 	return nil
 }
 
+// CleanupContestSandboxes deletes all sandbox pods, services, and configmaps
+// that belong to a specific contest. It waits for pod termination confirmation
+// to prevent NodePort conflicts on sequential runs.
+func CleanupContestSandboxes(ctx context.Context, contestID string) error {
+	config, err := getKubernetesConfig()
+	if err != nil {
+		return fmt.Errorf("cleanup contest sandboxes: %w", err)
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return fmt.Errorf("cleanup contest sandboxes: %w", err)
+	}
+
+	namespace := "trading-sandbox"
+	// Clean up all sandbox resources — contest pods don't carry a contest-id label
+	// in the current schema, so we clean all sandboxes after contest finalization.
+	cleanupOldSandboxes(ctx, clientset, namespace)
+
+	// Wait for all pods to be fully terminated (up to 30s)
+	if err := waitForPodsTerminated(ctx, clientset, namespace, 30*time.Second); err != nil {
+		fmt.Printf("WARNING: some contest sandbox pods may not have fully terminated: %v\n", err)
+		return err
+	}
+	fmt.Printf("Contest %s sandbox cleanup confirmed — all pods terminated\n", contestID)
+	return nil
+}
+
+// waitForPodsTerminated polls until no sandbox pods remain in the namespace,
+// or until the timeout expires. This prevents NodePort conflicts on sequential runs.
+func waitForPodsTerminated(ctx context.Context, clientset *kubernetes.Clientset, namespace string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		podList, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: "app=trading-sandbox",
+		})
+		if err != nil {
+			return fmt.Errorf("failed to list pods: %v", err)
+		}
+		if len(podList.Items) == 0 {
+			return nil
+		}
+		fmt.Printf("Waiting for %d sandbox pod(s) to terminate...\n", len(podList.Items))
+		time.Sleep(2 * time.Second)
+	}
+	return fmt.Errorf("timed out waiting for sandbox pods to terminate after %s", timeout)
+}
+
+
 // cleanupUserSandboxes removes existing sandbox pods, services, and configmaps
 // that match the given system name.
 func cleanupUserSandboxes(ctx context.Context, clientset *kubernetes.Clientset, namespace string, systemName string) {
@@ -406,13 +460,18 @@ func cleanupUserSandboxes(ctx context.Context, clientset *kubernetes.Clientset, 
 
 	selector := fmt.Sprintf("system-name=%s", sanitizedSystem)
 
+	gracePeriod := int64(0)
+	deleteOptions := metav1.DeleteOptions{
+		GracePeriodSeconds: &gracePeriod,
+	}
+
 	// Delete all pods with the system-name label
 	podList, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: selector,
 	})
 	if err == nil {
 		for _, pod := range podList.Items {
-			_ = clientset.CoreV1().Pods(namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
+			_ = clientset.CoreV1().Pods(namespace).Delete(ctx, pod.Name, deleteOptions)
 			fmt.Printf("Auto-cleanup: deleted old pod %s for system %s\n", pod.Name, systemName)
 		}
 	}
@@ -530,7 +589,7 @@ func buildSandboxSpec(absPath string, language string, port int) (sandboxSpec, e
 		}, nil
 	case "go":
 		return sandboxSpec{
-			image:   "golang:1.25",
+			image:   "golang:latest",
 			command: fmt.Sprintf("/usr/local/go/bin/go run /app/%s", fileName),
 			port:    port,
 		}, nil
@@ -549,4 +608,76 @@ func buildSandboxSpec(absPath string, language string, port int) (sandboxSpec, e
 	default:
 		return sandboxSpec{}, fmt.Errorf("unsupported language: %s", language)
 	}
+}
+
+// GetSandboxTargetURL finds the running sandbox pod/service for a given system name and returns its HTTP target URL.
+func GetSandboxTargetURL(ctx context.Context, systemName string) (string, error) {
+	config, err := getKubernetesConfig()
+	if err != nil {
+		return "", fmt.Errorf("failed to get k8s config: %v", err)
+	}
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return "", fmt.Errorf("failed to get k8s clientset: %v", err)
+	}
+
+	sanitizedSystem := sanitizeDNSName(systemName)
+	if sanitizedSystem == "" {
+		return "", fmt.Errorf("invalid system name")
+	}
+
+	selector := fmt.Sprintf("system-name=%s", sanitizedSystem)
+	namespace := "trading-sandbox"
+	
+	// Ensure pod is actually running and not in a crash loop
+	podList, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: selector,
+	})
+	if err != nil || len(podList.Items) == 0 {
+		return "", fmt.Errorf("no sandbox pod found for system %s", systemName)
+	}
+	
+	isRunning := false
+	for _, pod := range podList.Items {
+		if pod.Status.Phase == corev1.PodRunning {
+			isRunning = true
+			break
+		}
+	}
+	if !isRunning {
+		return "", fmt.Errorf("no running sandbox pod found for system %s", systemName)
+	}
+
+	svcList, err := clientset.CoreV1().Services(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: selector,
+	})
+	if err != nil || len(svcList.Items) == 0 {
+		return "", fmt.Errorf("no sandbox service found for system %s", systemName)
+	}
+
+	svc := svcList.Items[0]
+
+	if InCluster() {
+		return fmt.Sprintf("http://%s.trading-sandbox.svc.cluster.local:8080", svc.Name), nil
+	}
+
+	var nodePort int32
+	for _, p := range svc.Spec.Ports {
+		if p.NodePort > 0 {
+			nodePort = p.NodePort
+			break
+		}
+	}
+
+	if nodePort == 0 {
+		return "", fmt.Errorf("no node port assigned to service %s", svc.Name)
+	}
+
+	hostIP := "127.0.0.1"
+	if minikubeIP := os.Getenv("MINIKUBE_IP"); minikubeIP != "" && runtime.GOOS != "darwin" {
+		hostIP = minikubeIP
+	}
+
+	return fmt.Sprintf("http://%s:%d", hostIP, nodePort), nil
 }

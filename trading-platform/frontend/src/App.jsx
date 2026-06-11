@@ -8,6 +8,8 @@ import Leaderboard from './pages/Leaderboard';
 import ContestPage from './pages/ContestPage';
 import LoginPage from './pages/LoginPage';
 import RegisterPage from './pages/RegisterPage';
+import ProfilePage from './pages/ProfilePage';
+import HostDashboard from './pages/HostDashboard';
 
 function Shell() {
   const location = useLocation();
@@ -68,7 +70,9 @@ function Shell() {
               <div className="nav-user-avatar">
                 {user?.username?.charAt(0)?.toUpperCase() || '?'}
               </div>
-              <span className="nav-user-name">{user?.username}</span>
+              <Link to={`/profile/${user?.username}`} className="nav-user-name" style={{ textDecoration: 'none' }}>
+                {user?.username}
+              </Link>
               <button className="nav-logout-btn" onClick={logout} title="Sign out">
                 ↪
               </button>
@@ -92,6 +96,12 @@ function Shell() {
           } />
           <Route path="/contests" element={
             <ProtectedRoute><ContestPage /></ProtectedRoute>
+          } />
+          <Route path="/profile/:username" element={
+            <ProtectedRoute><ProfilePage /></ProtectedRoute>
+          } />
+          <Route path="/host" element={
+            <ProtectedRoute><HostDashboard /></ProtectedRoute>
           } />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

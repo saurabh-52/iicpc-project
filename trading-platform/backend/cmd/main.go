@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -32,6 +33,8 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/websocket/v2"
 )
+
+var sourceCodeMap sync.Map
 
 // sandboxOutcome bundles the result of an ExecuteCode call so it can be sent
 // safely through a channel without sharing mutable state across goroutines.
@@ -164,6 +167,133 @@ func buildTargetURL(result sandbox.ExecutionResult, protocol string, containerPo
 		return fmt.Sprintf("%s:%d", hostIP, portToUse)
 	}
 	return fmt.Sprintf("http://%s:%d", hostIP, portToUse)
+}
+
+func runFinalization(ctx context.Context, contestID string, contest store.Contest, teams []string, db *store.Store, hub *ws.Hub, redisClient *redis.Client) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC in finalization goroutine: %v", r)
+		}
+	}()
+
+	var finalScores []store.FinalScoreInput
+	totalTeams := len(teams)
+
+	problems, _ := db.GetContestProblems(ctx, contestID)
+	hiddenStrategies := contest.FinalStrategies
+	if len(problems) > 0 && len(problems[0].HiddenStrategies) > 0 {
+		hiddenStrategies = problems[0].HiddenStrategies
+	}
+
+	bestLiveScores, err := db.GetBestLiveScoresForContest(ctx, contestID)
+	if err != nil {
+		log.Printf("[Finalize] WARNING: could not fetch best live scores: %v", err)
+		bestLiveScores = make(map[string]store.BestLiveScore)
+	}
+
+	for idx, teamName := range teams {
+		var roundResults []map[string]interface{}
+		var allScores, allLat, allThr, allCor, allP99, allTPS []float64
+
+		if best, ok := bestLiveScores[teamName]; ok {
+			allScores = append(allScores, best.TotalScore)
+			allLat = append(allLat, best.LatencyScore)
+			allThr = append(allThr, best.ThroughputScore)
+			allCor = append(allCor, best.CorrectnessScore)
+			allP99 = append(allP99, best.P99LatencyMs)
+			allTPS = append(allTPS, best.TPS)
+			roundResults = append(roundResults, map[string]interface{}{
+				"label": fmt.Sprintf("Best Live (%s)", best.Strategy),
+				"score": best.TotalScore,
+				"grade": best.Grade,
+			})
+		}
+
+		targetURL, err := sandbox.GetSandboxTargetURL(ctx, teamName)
+		if err != nil {
+			roundResults = append(roundResults, map[string]interface{}{
+				"label": "Hidden Strategies",
+				"score": 0.0,
+				"error": "sandbox not running — scored from live submissions only",
+			})
+		} else {
+			for i, stratName := range hiddenStrategies {
+				strategy := botfleet.NormalizeStrategy(stratName)
+				submissionID := fmt.Sprintf("finalize-%s-%d-%d", contestID, time.Now().UnixNano(), i)
+				seed := botfleet.DeterministicSeedForStrategy(strategy)
+
+				runCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				metrics, runErr := botfleet.Run(runCtx, botfleet.Config{
+					Target: targetURL, Protocol: "http", Strategy: strategy, Bots: 32,
+					Requests: 0, Duration: 10 * time.Second, Timeout: 2 * time.Second,
+					Method: "POST", Path: "/", ExpectReply: true, RampUpDuration: 0,
+					TelemetryClient: nil, SubmissionID: submissionID,
+					JudgingMode: "contest_final", ContestID: contestID, Seed: seed,
+				})
+				cancel()
+				time.Sleep(1 * time.Second)
+
+				roundScore, roundLat, roundThr, roundCor, roundP99, roundTPS := 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+				roundGrade := "F"
+
+				if runErr == nil && metrics.Successes > 0 {
+					perfMetrics := scorer.PerformanceMetrics{
+						SubmissionID: submissionID, TotalRequests: metrics.Requests, Successes: metrics.Successes, Failures: metrics.Failures,
+						TPS: metrics.RequestsPerSecond, MinLatencyMs: metrics.MinLatencyMs, AvgLatencyMs: metrics.AverageLatencyMs,
+						P50LatencyMs: metrics.P50LatencyMs, P90LatencyMs: metrics.P90LatencyMs, P99LatencyMs: metrics.P99LatencyMs,
+						MaxLatencyMs: metrics.MaxLatencyMs, StdDevMs: metrics.StdDevMs,
+					}
+					valResult := validator.ValidationResult{}
+					sc := scorer.ComputeScore(perfMetrics, valResult)
+					roundScore, roundLat, roundThr, roundCor, roundGrade, roundP99, roundTPS = sc.TotalScore, sc.LatencyScore, sc.ThroughputScore, sc.CorrectnessScore, sc.Grade, perfMetrics.P99LatencyMs, perfMetrics.TPS
+				}
+
+				if roundScore > 0 {
+					allScores = append(allScores, roundScore)
+					allLat = append(allLat, roundLat)
+					allThr = append(allThr, roundThr)
+					allCor = append(allCor, roundCor)
+					allP99 = append(allP99, roundP99)
+					allTPS = append(allTPS, roundTPS)
+				}
+				roundResults = append(roundResults, map[string]interface{}{"label": stratName, "score": roundScore, "grade": roundGrade})
+			}
+		}
+
+		avgScore, avgLat, avgThr, avgCor, avgP99, avgTPS := 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+		finalGrade := "N/A"
+		if len(allScores) > 0 {
+			for _, v := range allScores { avgScore += v }
+			for _, v := range allLat { avgLat += v }
+			for _, v := range allThr { avgThr += v }
+			for _, v := range allCor { avgCor += v }
+			for _, v := range allP99 { avgP99 += v }
+			for _, v := range allTPS { avgTPS += v }
+			n := float64(len(allScores))
+			avgScore /= n
+			avgLat /= n
+			avgThr /= n
+			avgCor /= n
+			avgP99 /= n
+			avgTPS /= n
+			if avgScore >= 95 { finalGrade = "A+" } else if avgScore >= 90 { finalGrade = "A" } else if avgScore >= 80 { finalGrade = "B" } else if avgScore >= 70 { finalGrade = "C" } else if avgScore >= 60 { finalGrade = "D" } else { finalGrade = "F" }
+		}
+
+		mockRoundsJSONBytes, _ := json.Marshal(roundResults)
+		finalScores = append(finalScores, store.FinalScoreInput{
+			SystemName: teamName, AvgScore: avgScore, AvgLatency: avgLat, AvgThroughput: avgThr,
+			AvgCorrectness: avgCor, AvgP99: avgP99, AvgTPS: avgTPS, RoundScores: string(mockRoundsJSONBytes), FinalGrade: finalGrade,
+		})
+
+		hub.Broadcast(ws.FinalizationProgressUpdate{Type: "finalization_progress", Contest: contestID, Progress: int(float64(idx+1) / float64(totalTeams) * 100)})
+	}
+
+	if err := db.SaveFinalScoresAndCompleteContest(ctx, contestID, finalScores); err != nil { log.Printf("ERROR: %v", err) }
+	if err := sandbox.CleanupContestSandboxes(ctx, contestID); err != nil { log.Printf("WARNING: %v", err) }
+	if redisClient != nil { _ = telemetry.TrimStream(ctx, redisClient) }
+	if finalScoresList, err := db.GetContestFinalScores(ctx, contestID, 50); err == nil {
+		hub.Broadcast(ws.LeaderboardUpdate{Type: "contest_finalized", Payload: finalScoresList})
+	}
 }
 
 func main() {
@@ -513,6 +643,7 @@ func main() {
 		}
 		// Ensure host disk cleanup once this request returns
 		defer os.Remove(filePath)
+		sourceCodeBytes, _ := os.ReadFile(filePath)
 
 		fmt.Println("Attempting to start sandbox for:", filePath)
 
@@ -588,6 +719,7 @@ func main() {
 
 		// Construct the target URL the bot fleet should use.
 		targetURL := buildTargetURL(executionResult, protocol, port)
+		sourceCodeMap.Store(targetURL, string(sourceCodeBytes))
 
 		fmt.Println("✓ Submission processed successfully, returning JSON response")
 		response := fiber.Map{
@@ -750,8 +882,14 @@ func main() {
 					if uid, ok := c.Locals("user_id").(string); ok {
 						submitUserID = uid
 					}
+					sourceCodeStr := ""
+					if src, ok := sourceCodeMap.LoadAndDelete(req.Target); ok {
+						if str, valid := src.(string); valid {
+							sourceCodeStr = str
+						}
+					}
 					sr := store.NewSubmissionResultWithMode(
-						submissionID, systemName, string(strategy), "", submitUserID,
+						submissionID, systemName, string(strategy), "", submitUserID, sourceCodeStr,
 						sc, perfMetrics, valResult,
 						string(judgingMode), req.ContestID, nil, seed,
 					)
@@ -990,6 +1128,10 @@ func main() {
 			}
 		}
 
+		if startTime.Before(time.Now().Add(-1 * time.Minute)) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "contest start time cannot be in the past"})
+		}
+
 		var regDeadline *time.Time
 		if strings.TrimSpace(payload.Details.RegistrationDeadline) != "" {
 			parsedDead, err := time.Parse(time.RFC3339, payload.Details.RegistrationDeadline)
@@ -1058,7 +1200,37 @@ func main() {
 		})
 	})
 
-	// --- Get full contest details (for editing, host only) ---
+	// Contest details route (public view)
+	app.Get("/contests/:id/public", func(c *fiber.Ctx) error {
+		if db == nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"message": "database not available"})
+		}
+		
+		contestID := c.Params("id")
+		contest, err := db.GetContest(c.Context(), contestID)
+		if err != nil {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"message": "contest not found"})
+		}
+		// Don't expose private code
+		contest.Code = ""
+		
+		problems, err := db.GetContestProblems(c.Context(), contestID)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "failed to get problems", "error": err.Error()})
+		}
+		
+		// Strip hidden strategies and bot files
+		for i := range problems {
+			problems[i].HiddenStrategies = nil
+			problems[i].HiddenBotFilesJSON = ""
+		}
+
+		return c.JSON(fiber.Map{
+			"details": contest,
+			"problems": problems,
+		})
+	})
+
 	app.Get("/contests/:id/full", auth.AuthMiddleware(), func(c *fiber.Ctx) error {
 		if db == nil {
 			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"message": "database not available"})
@@ -1169,8 +1341,18 @@ func main() {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "failed to get registrations", "error": err.Error()})
 		}
 
+		// Fallback: If no official registrations, find anyone who submitted code for this contest
 		if len(teams) == 0 {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "no teams registered for this contest"})
+			fallbackTeams, err := db.GetUnregisteredParticipants(c.Context(), contestID)
+			if err == nil {
+				teams = fallbackTeams
+			}
+		}
+
+		if len(teams) == 0 {
+			// Instead of failing, just complete the contest immediately if absolutely no one submitted
+			_ = db.UpdateContestPhase(c.Context(), contestID, "completed")
+			return c.JSON(fiber.Map{"message": "No teams submitted. Contest finalized."})
 		}
 
 		// NOTE: In a real deployment, each team's sandbox would need to be running.
@@ -1195,66 +1377,7 @@ func main() {
 		}
 
 		// Run finalization in background so the HTTP request doesn't timeout
-		go func() {
-			ctx := context.Background()
-			frc := botfleet.FinalRoundConfig{
-				ContestID:    contestID,
-				Rounds:       finalRounds,
-				BotCount:     body.BotCount,
-				RequestCount: body.RequestCount,
-				Duration:     time.Duration(body.DurationSecs) * time.Second,
-				Timeout:      2 * time.Second,
-				RedisClient:  redisClient,
-			}
-
-			totalTeams := len(teams)
-			for idx, teamName := range teams {
-				log.Printf("[Finalize] Mock evaluating team %s for contest %s", teamName, contestID)
-				
-				// Get latest submission to copy over to final
-				_, liveResults, _ := db.GetContestLeaderboard(ctx, contestID, 1000)
-				var avgScore float64 = 0
-				finalGrade := "N/A"
-				for _, r := range liveResults {
-					if r.SystemName == teamName {
-						avgScore = r.TotalScore
-						finalGrade = r.Grade
-						break
-					}
-				}
-
-				// Simulate finalization delay
-				time.Sleep(2 * time.Second)
-
-				// Save mock final score
-				mockRoundsJSON := `[{"label": "Mock Round", "score": ` + fmt.Sprintf("%f", avgScore) + `}]`
-				_ = db.SaveFinalScore(ctx, contestID, teamName, avgScore, mockRoundsJSON, finalGrade)
-
-				// Broadcast progress
-				progress := int(float64(idx+1) / float64(totalTeams) * 100)
-				hub.Broadcast(ws.FinalizationProgressUpdate{
-					Type:     "finalization_progress",
-					Contest:  contestID,
-					Progress: progress,
-				})
-			}
-
-			// Mark as completed
-			if err := db.UpdateContestPhase(ctx, contestID, "completed"); err != nil {
-				log.Printf("WARNING: failed to set contest phase to completed: %v", err)
-			}
-
-			// Broadcast updated leaderboard
-			if finalScores, err := db.GetContestFinalScores(ctx, contestID, 50); err == nil {
-				hub.Broadcast(ws.LeaderboardUpdate{
-					Type:    "contest_finalized",
-					Payload: finalScores,
-				})
-			}
-
-			_ = frc // suppress unused warning until sandbox URLs are wired
-			log.Printf("[Finalize] Finalization complete for contest %s", contestID)
-		}()
+		go runFinalization(context.Background(), contestID, contest, teams, db, hub, redisClient)
 
 		return c.JSON(fiber.Map{
 			"message":    "Finalization started",

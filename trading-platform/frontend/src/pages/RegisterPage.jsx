@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 
@@ -12,12 +12,44 @@ export default function RegisterPage() {
     confirmPassword: '',
   });
   const [error, setError] = useState('');
+  const [usernameStatus, setUsernameStatus] = useState({ checking: false, available: null, message: '' });
+  const checkTimeout = useRef(null);
   const [submitting, setSubmitting] = useState(false);
 
   const handleChange = (e) => {
     setForm(prev => ({ ...prev, [e.target.name]: e.target.value }));
     setError('');
   };
+
+  useEffect(() => {
+    const uname = form.username.trim();
+    if (uname.length < 3) {
+      setUsernameStatus({ checking: false, available: null, message: '' });
+      return;
+    }
+
+    setUsernameStatus(prev => ({ ...prev, checking: true, message: '' }));
+    
+    if (checkTimeout.current) clearTimeout(checkTimeout.current);
+    
+    checkTimeout.current = setTimeout(async () => {
+      try {
+        const res = await fetch(`/api/users/check-username?username=${encodeURIComponent(uname)}`);
+        const data = await res.json();
+        if (res.ok) {
+          setUsernameStatus({
+            checking: false,
+            available: data.available,
+            message: data.available ? 'Username available' : 'Username taken'
+          });
+        }
+      } catch (err) {
+        setUsernameStatus({ checking: false, available: null, message: '' });
+      }
+    }, 300);
+
+    return () => clearTimeout(checkTimeout.current);
+  }, [form.username]);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -78,7 +110,7 @@ export default function RegisterPage() {
           <label className="auth-field">
             <span className="auth-label">Username</span>
             <input
-              className="auth-input"
+              className={`auth-input ${usernameStatus.available === false ? 'auth-input-error' : ''}`}
               type="text"
               name="username"
               required
@@ -88,6 +120,12 @@ export default function RegisterPage() {
               onChange={handleChange}
               disabled={submitting}
             />
+            {usernameStatus.checking && <span className="auth-helper">Checking availability...</span>}
+            {!usernameStatus.checking && usernameStatus.message && (
+              <span className={`auth-helper ${usernameStatus.available ? 'success-text' : 'error-text'}`}>
+                {usernameStatus.message}
+              </span>
+            )}
           </label>
 
           <label className="auth-field">

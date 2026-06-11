@@ -37,6 +37,10 @@ spec:
           env:
             - name: PORT
               value: "3000"
+            - name: REDIS_ADDR
+              value: "host.minikube.internal:6379"
+            - name: POSTGRES_URL
+              value: "postgres://user:password@host.minikube.internal:5432/postgres?sslmode=disable"
           livenessProbe:
             httpGet:
               path: /health

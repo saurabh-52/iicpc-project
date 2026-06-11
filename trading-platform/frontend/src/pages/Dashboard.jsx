@@ -239,6 +239,20 @@ export default function Dashboard() {
           </div>
           <span className="db-pathway-arrow">→</span>
         </Link>
+
+        <Link to="/host" className="db-pathway-card" style={{ background: 'linear-gradient(to right bottom, #fff, #f8fafc)' }}>
+          <div className="db-pathway-icon">⚙️</div>
+          <div className="db-pathway-content">
+            <h3>Host Tools</h3>
+            <p>Upload custom evaluation bots and run lightweight demo traffic isolated from the global leaderboards.</p>
+            <ul className="db-pathway-features">
+              <li>🤖 Upload bot binaries</li>
+              <li>⚡ Run isolated demo tests</li>
+              <li>🎛️ Configure test duration and scale</li>
+            </ul>
+          </div>
+          <span className="db-pathway-arrow">→</span>
+        </Link>
       </div>
 
       {/* Your Stats */}
@@ -303,7 +317,7 @@ export default function Dashboard() {
                 </span>
                 <div style={{ flex: 1 }}>
                   <span style={{ fontWeight: '600', fontSize: '0.9rem', color: '#0f172a' }}>
-                    {entry.system_name || 'Unknown'}
+                    {entry.username || entry.system_name || 'Unknown'}
                   </span>
                 </div>
                 <span style={{

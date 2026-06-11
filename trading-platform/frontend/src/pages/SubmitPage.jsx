@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 
@@ -175,6 +175,7 @@ function HistoryModal({ history, systemName, onClose, onSelect }) {
                 <thead>
                   <tr>
                     <th style={{ padding: '0.85rem 1rem' }}>Date</th>
+                    <th style={{ padding: '0.85rem 1rem' }}>Context</th>
                     <th style={{ padding: '0.85rem 1rem' }}>Strategy</th>
                     <th style={{ padding: '0.85rem 1rem' }}>Grade</th>
                     <th style={{ padding: '0.85rem 1rem' }}>Score</th>
@@ -193,6 +194,15 @@ function HistoryModal({ history, systemName, onClose, onSelect }) {
                     >
                       <td style={{ padding: '0.85rem 1rem', color: '#64748b', fontSize: '0.85rem' }}>
                         {new Date(run.submitted_at).toLocaleDateString()} {new Date(run.submitted_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                      </td>
+                      <td style={{ padding: '0.85rem 1rem', fontSize: '0.85rem' }}>
+                        {run.contest_id ? (
+                          <span style={{ color: '#ef4444', fontWeight: '600' }}>Contest: {run.contest_id}</span>
+                        ) : run.judging_mode === 'practice' ? (
+                          <span style={{ color: 'var(--accent)', fontWeight: '600' }}>Practice</span>
+                        ) : (
+                          <span style={{ color: '#94a3b8', fontStyle: 'italic' }}>Unknown</span>
+                        )}
                       </td>
                       <td className="strategy-cell" style={{ padding: '0.85rem 1rem' }}>
                         {strategyLabel(run.strategy)}
@@ -240,7 +250,7 @@ export default function SubmitPage() {
     port: '8080',
     language: 'cpp',
     protocol: 'http',
-    strategy: urlStrategy || 'bbo_heavy',
+    strategy: '', // Initialize empty, will be set when contest data loads
     rampUpSeconds: '0',
     file: null,
     contestId: urlContestId
@@ -254,6 +264,64 @@ export default function SubmitPage() {
   const [showHistory, setShowHistory] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [selectedSubmission, setSelectedSubmission] = useState(null);
+  const [contestData, setContestData] = useState(null);
+
+  useEffect(() => {
+    if (urlContestId) {
+      fetch(`/api/contests/${urlContestId}/public`)
+        .then(res => res.json())
+        .then(data => {
+          if (data && data.details) {
+            setContestData(data);
+            if (data.details.strategy) {
+              setFormData(prev => ({ ...prev, strategy: data.details.strategy }));
+            }
+          }
+        })
+        .catch(console.error);
+    }
+  }, [urlContestId]);
+
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  const isContestUpcoming = useMemo(() => {
+    if (!contestData || !contestData.details) return false;
+    const start = new Date(contestData.details.startTime);
+    return new Date() < start;
+  }, [contestData]);
+
+  const isContestEnded = useMemo(() => {
+    if (!contestData || !contestData.details) return false;
+    const end = new Date(new Date(contestData.details.startTime).getTime() + (contestData.details.durationMinutes || 60) * 60000);
+    return new Date() >= end;
+  }, [contestData]);
+
+  const getRemainingTime = () => {
+    if (!contestData?.details?.startTime) return '';
+    const start = new Date(contestData.details.startTime);
+    const end = new Date(start.getTime() + (contestData.details.durationMinutes || 60) * 60000);
+    
+    if (now < start.getTime()) {
+      const diff = start.getTime() - now;
+      const d = Math.floor(diff / 86400000);
+      const h = Math.floor((diff % 86400000) / 3600000);
+      const m = Math.floor((diff % 3600000) / 60000);
+      const s = Math.floor((diff % 60000) / 1000);
+      if (d > 0) return `Starts in ${d}d ${h}h`;
+      return `Starts in ${h}h ${m}m ${s}s`;
+    }
+
+    const diff = end.getTime() - now;
+    if (diff <= 0) return 'Ended';
+    const h = Math.floor(diff / 3600000);
+    const m = Math.floor((diff % 3600000) / 60000);
+    const s = Math.floor((diff % 60000) / 1000);
+    return `${h}h ${m}m ${s}s`;
+  };
 
   // Auto-update systemName when user changes
   useEffect(() => {
@@ -395,7 +463,8 @@ export default function SubmitPage() {
             strategy: formData.strategy,
             system_name: formData.systemName,
             bots: 16,
-            requests: 48,
+            requests: 0,
+            duration_seconds: 10,
             timeout_ms: 2000,
             method: 'POST',
             path: '/',
@@ -454,11 +523,23 @@ export default function SubmitPage() {
     <section className="submit-layout">
       <aside className="panel submit-aside">
         <span className="section-tag">Submit engine</span>
-        <h2>Upload a trading system for sandbox execution.</h2>
-        <p>
-          Provide a source file, expose the port, and choose a stress profile so the platform can
-          package and run the engine in isolation.
-        </p>
+        {contestData?.details ? (
+          <div style={{ marginBottom: '1.5rem', padding: '1rem', background: 'rgba(255,255,255,0.03)', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.1)' }}>
+            <h2 style={{ marginTop: 0, marginBottom: '0.5rem', fontSize: '1.4rem' }}>{contestData.details.name}</h2>
+            <h3 style={{ margin: '0 0 0.5rem 0', fontSize: '1rem', color: 'var(--text-muted)' }}>Task Description</h3>
+            <div style={{ fontSize: '0.9rem', color: 'var(--text)', whiteSpace: 'pre-wrap' }}>
+              {contestData.details.description || "No description provided by host."}
+            </div>
+          </div>
+        ) : (
+          <>
+            <h2>Upload a trading system for sandbox execution.</h2>
+            <p>
+              Provide a source file, expose the port, and choose a stress profile so the platform can
+              package and run the engine in isolation.
+            </p>
+          </>
+        )}
 
         {formData.contestId ? (
           <div style={{
@@ -496,272 +577,303 @@ export default function SubmitPage() {
           </div>
         )}
 
-        <div className="checklist">
-          <div>
-            <strong>Accepted files</strong>
-            <span>C++, Rust, Go, Python</span>
+        {formData.contestId && contestData?.details && (
+          <div style={{
+            background: 'rgba(15, 23, 42, 0.02)',
+            border: '1px solid rgba(148, 163, 184, 0.2)',
+            borderRadius: '8px',
+            padding: '1rem',
+            marginBottom: '1.5rem',
+            textAlign: 'center'
+          }}>
+            <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginBottom: '0.25rem', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: '600' }}>
+              {isContestUpcoming ? 'Contest Status' : isContestEnded ? 'Contest Status' : 'Time Remaining'}
+            </div>
+            <div style={{ fontSize: '1.75rem', fontWeight: '700', color: isContestEnded ? '#ef4444' : 'var(--text-h)', fontVariantNumeric: 'tabular-nums' }}>
+              {getRemainingTime()}
+            </div>
           </div>
-          <div>
-            <strong>Backend route</strong>
-            <span>/submit</span>
-          </div>
-          <div>
-            <strong>Upload method</strong>
-            <span>Multipart form data</span>
-          </div>
-          <div>
-            <strong>Judging mode</strong>
-            <span>100% fixed seed (reproducible)</span>
-          </div>
-        </div>
+        )}
 
-        <Link className="button button-secondary" to="/">
-          Back to dashboard
-        </Link>
+        <div style={{ display: 'flex', gap: '0.5rem', flexDirection: 'column' }}>
+          {formData.contestId && (
+            <Link className="button button-primary" style={{ textAlign: 'center' }} to={`/leaderboard?contest_id=${formData.contestId}`}>
+              Go to Leaderboard
+            </Link>
+          )}
+          <Link className="button button-secondary" style={{ textAlign: 'center' }} to="/">
+            Back to dashboard
+          </Link>
+        </div>
       </aside>
 
-      <section className="panel form-card">
-        <div className="section-header">
-          <div>
-            <span className="section-tag">Submission form</span>
-            <h3>Engine details</h3>
-          </div>
-        </div>
-
-        <form onSubmit={handleSubmit} className="submit-form">
-          <label className="field">
-            <span>System Name</span>
-            <input
-              required
-              type="text"
-              name="systemName"
-              value={formData.systemName}
-              onChange={handleChange}
-              placeholder="e.g., UltraFast-Matcher"
-            />
-          </label>
-
-          <div className="field-grid">
-            <label className="field">
-              <span>Exposed Port</span>
-              <input required type="number" name="port" value={formData.port} onChange={handleChange} />
-            </label>
-
-            <label className="field">
-              <span>Language</span>
-              <select name="language" value={formData.language} onChange={handleChange}>
-                <option value="cpp">C++</option>
-                <option value="go">Go</option>
-                <option value="rust">Rust</option>
-                <option value="python">Python</option>
-              </select>
-            </label>
-
-            <label className="field">
-              <span>Protocol</span>
-              <select name="protocol" value={formData.protocol} onChange={handleChange}>
-                <option value="http">HTTP / REST</option>
-                <option value="tcp">Raw TCP</option>
-                <option value="fix">FIX Protocol</option>
-              </select>
-            </label>
+      {(!formData.contestId || (!isContestUpcoming && !isContestEnded)) ? (
+        <section className="panel form-card">
+          <div className="section-header">
+            <div>
+              <span className="section-tag">Submission form</span>
+              <h3>Engine details</h3>
+            </div>
           </div>
 
-          <label className="field">
-            <span>Stress Test Strategy</span>
-            <select
-              name="strategy"
-              value={formData.strategy}
-              onChange={handleChange}
-              disabled={!!formData.contestId || isSubmitting}
-            >
-              <option value="bbo_heavy">BBO Heavy (Common)</option>
-              <option value="flash_crash">Flash Crash</option>
-              <option value="high_cancel">High Cancel Rate</option>
-              <option value="wide_spread">Wide Spread</option>
-              <option value="market_maker">Market Maker</option>
-              <option value="iceberg">Iceberg Orders</option>
-              <option value="momentum_burst">Momentum Burst</option>
-            </select>
-            {formData.contestId && (
-              <span style={{ fontSize: '0.75rem', color: '#888', marginTop: '4px', display: 'block' }}>
-                Locked to contest strategy
-              </span>
-            )}
-          </label>
+          <form onSubmit={handleSubmit} className="submit-form">
+            <div className="field-grid">
+              <label className="field">
+                <span>Exposed Port</span>
+                <input required type="number" name="port" value={formData.port} onChange={handleChange} />
+              </label>
 
-          <div className="field-grid">
+              <label className="field">
+                <span>Language</span>
+                <select name="language" value={formData.language} onChange={handleChange}>
+                  <option value="cpp">C++</option>
+                  <option value="go">Go</option>
+                  <option value="rust">Rust</option>
+                  <option value="python">Python</option>
+                </select>
+              </label>
+
+              <label className="field">
+                <span>Protocol</span>
+                <select name="protocol" value={formData.protocol} onChange={handleChange}>
+                  <option value="http">HTTP / REST</option>
+                  <option value="tcp">Raw TCP</option>
+                  <option value="fix">FIX Protocol</option>
+                </select>
+              </label>
+            </div>
+
             <label className="field">
-              <span>Ramp-Up (seconds)</span>
-              <input type="number" name="rampUpSeconds" value={formData.rampUpSeconds} min="0" max="30" onChange={handleChange} />
+              <span>Stress Test Strategy</span>
+              {formData.contestId ? (
+                <div style={{ padding: '0.95rem 1rem', background: 'rgba(241, 245, 249, 0.5)', borderRadius: '1rem', border: '1px solid rgba(148, 163, 184, 0.35)', color: '#475569', fontWeight: '500' }}>
+                  {contestData?.details?.strategy 
+                    ? contestData.details.strategy.split(',').filter(Boolean).map(s => strategyLabel(s)).join(', ') 
+                    : strategyLabel(formData.strategy)}
+                  <span style={{ display: 'block', fontSize: '0.75rem', color: '#6366f1', marginTop: '0.25rem', fontWeight: '600' }}>(Configured by Host)</span>
+                </div>
+              ) : (
+                <select
+                  name="strategy"
+                  value={formData.strategy}
+                  onChange={handleChange}
+                  disabled={isSubmitting}
+                >
+                  <option value="bbo_heavy">BBO Heavy (Common)</option>
+                  <option value="flash_crash">Flash Crash</option>
+                  <option value="high_cancel">High Cancel Rate</option>
+                  <option value="wide_spread">Wide Spread</option>
+                  <option value="market_maker">Market Maker</option>
+                  <option value="iceberg">Iceberg Orders</option>
+                  <option value="momentum_burst">Momentum Burst</option>
+                </select>
+              )}
             </label>
-          </div>
 
-          <label className="field upload-field">
-            <span>Source Code</span>
-            <input required type="file" name="file" accept=".cpp,.cc,.cxx,.rs,.go,.py" onChange={handleChange} />
-          </label>
+            <div className="field-grid">
+              <label className="field">
+                <span>Ramp-Up (seconds)</span>
+                <input type="number" name="rampUpSeconds" value={formData.rampUpSeconds} min="0" max="30" onChange={handleChange} />
+              </label>
+            </div>
 
-          {submitState.message ? (
-            <div className={`feedback ${submitState.type}`}>{submitState.message}</div>
-          ) : null}
+            <label className="field upload-field">
+              <span>Source Code</span>
+              <input required type="file" name="file" accept=".cpp,.cc,.cxx,.rs,.go,.py" onChange={handleChange} />
+            </label>
 
-          {executionResult ? (
-            <section className="result-panel">
-              <div className="result-row">
-                <span>Pod ID</span>
-                <strong>{executionResult.pod_id}</strong>
-              </div>
-              <div className="result-row">
-                <span>Service</span>
-                <strong>{executionResult.service_name}</strong>
-              </div>
-              <div className="result-row">
-                <span>Phase</span>
-                <strong>{executionResult.phase}</strong>
-              </div>
-              {executionResult.node_port ? (
+            {submitState.message ? (
+              <div className={`feedback ${submitState.type}`}>{submitState.message}</div>
+            ) : null}
+
+            {executionResult ? (
+              <section className="result-panel">
                 <div className="result-row">
-                  <span>NodePort</span>
-                  <strong>{executionResult.node_port}</strong>
+                  <span>Pod ID</span>
+                  <strong>{executionResult.pod_id}</strong>
                 </div>
-              ) : null}
-              {executionResult.target_url ? (
                 <div className="result-row">
-                  <span>Target</span>
-                  <strong>{executionResult.target_url}</strong>
+                  <span>Service</span>
+                  <strong>{executionResult.service_name}</strong>
                 </div>
-              ) : null}
-              {executionResult.output ? (
-                <div className="result-output" style={{ marginTop: '0.5rem' }}>
-                  <span>Execution Output / Logs</span>
-                  <pre>{executionResult.output}</pre>
+                <div className="result-row">
+                  <span>Phase</span>
+                  <strong>{executionResult.phase}</strong>
                 </div>
-              ) : null}
-              <button
-                type="button"
-                className="button button-secondary"
-                style={{ marginTop: '0.5rem', fontSize: '0.85rem', padding: '0.6rem 1rem' }}
-                onClick={handleCleanup}
-              >
-                🗑️ Cleanup sandbox
-              </button>
-            </section>
-          ) : null}
+                {executionResult.node_port ? (
+                  <div className="result-row">
+                    <span>NodePort</span>
+                    <strong>{executionResult.node_port}</strong>
+                  </div>
+                ) : null}
+                {executionResult.target_url ? (
+                  <div className="result-row">
+                    <span>Target</span>
+                    <strong>{executionResult.target_url}</strong>
+                  </div>
+                ) : null}
+                {executionResult.output ? (
+                  <div className="result-output" style={{ marginTop: '0.5rem' }}>
+                    <span>Execution Output / Logs</span>
+                    <pre>{executionResult.output}</pre>
+                  </div>
+                ) : null}
+                <button
+                  type="button"
+                  className="button button-secondary"
+                  style={{ marginTop: '0.5rem', fontSize: '0.85rem', padding: '0.6rem 1rem' }}
+                  onClick={handleCleanup}
+                >
+                  🗑️ Cleanup sandbox
+                </button>
+              </section>
+            ) : null}
 
-          {stressTestResult ? (
-            <section className="result-panel">
-              {stressTestMeta ? (
-                <div style={{
-                  display: 'flex',
-                  gap: '0.5rem',
-                  marginBottom: '0.75rem',
-                  flexWrap: 'wrap',
-                }}>
-                  <span style={{
-                    background: 'rgba(99, 102, 241, 0.15)',
-                    color: 'var(--accent)',
-                    padding: '0.25rem 0.6rem',
-                    borderRadius: '6px',
-                    fontSize: '0.75rem',
-                    fontWeight: 600,
-                    textTransform: 'uppercase',
-                    letterSpacing: '0.5px',
+            {stressTestResult ? (
+              <section className="result-panel">
+                {stressTestMeta ? (
+                  <div style={{
+                    display: 'flex',
+                    gap: '0.5rem',
+                    marginBottom: '0.75rem',
+                    flexWrap: 'wrap',
                   }}>
-                    ⚡ {stressTestMeta.judgingMode === 'practice' ? 'Practice' : stressTestMeta.judgingMode}
-                  </span>
-                  {stressTestMeta.seedUsed != null ? (
                     <span style={{
-                      background: 'rgba(255, 255, 255, 0.05)',
-                      color: 'var(--muted)',
+                      background: 'rgba(99, 102, 241, 0.15)',
+                      color: 'var(--accent)',
                       padding: '0.25rem 0.6rem',
                       borderRadius: '6px',
                       fontSize: '0.75rem',
-                      fontFamily: 'monospace',
+                      fontWeight: 600,
+                      textTransform: 'uppercase',
+                      letterSpacing: '0.5px',
                     }}>
-                      seed: 0x{stressTestMeta.seedUsed.toString(16)}
+                      ⚡ {stressTestMeta.judgingMode === 'practice' ? 'Practice' : stressTestMeta.judgingMode}
                     </span>
-                  ) : null}
+                    {stressTestMeta.seedUsed != null ? (
+                      <span style={{
+                        background: 'rgba(255, 255, 255, 0.05)',
+                        color: 'var(--muted)',
+                        padding: '0.25rem 0.6rem',
+                        borderRadius: '6px',
+                        fontSize: '0.75rem',
+                        fontFamily: 'monospace',
+                      }}>
+                        seed: 0x{stressTestMeta.seedUsed.toString(16)}
+                      </span>
+                    ) : null}
+                  </div>
+                ) : null}
+                <div className="result-row">
+                  <span>Strategy</span>
+                  <strong>{stressTestResult.strategy}</strong>
                 </div>
-              ) : null}
-              <div className="result-row">
-                <span>Strategy</span>
-                <strong>{stressTestResult.strategy}</strong>
-              </div>
-              <div className="result-row">
-                <span>Target</span>
-                <strong>{stressTestResult.target}</strong>
-              </div>
-              <div className="result-row">
-                <span>Requests</span>
-                <strong>{stressTestResult.requests}</strong>
-              </div>
-              <div className="result-row">
-                <span>Successes</span>
-                <strong>{stressTestResult.successes}</strong>
-              </div>
-              <div className="result-row">
-                <span>Failures</span>
-                <strong>{stressTestResult.failures}</strong>
-              </div>
-              <div className="result-row">
-                <span>TPS</span>
-                <strong>
-                  {stressTestResult.requests_per_second != null
-                    ? stressTestResult.requests_per_second.toFixed(1)
-                    : '—'}
-                </strong>
-              </div>
-              <div className="result-output">
-                <span>Latency summary</span>
-                <pre>
-                  {stressTestResult.min_latency_ms != null
-                    ? `min: ${stressTestResult.min_latency_ms.toFixed(2)}ms\n`
-                    : ''}
-                  {stressTestResult.avg_latency_ms != null
-                    ? `avg: ${stressTestResult.avg_latency_ms.toFixed(2)}ms\n`
-                    : ''}
-                  {stressTestResult.p50_latency_ms != null
-                    ? `p50: ${stressTestResult.p50_latency_ms.toFixed(2)}ms\n`
-                    : ''}
-                  {stressTestResult.p90_latency_ms != null
-                    ? `p90: ${stressTestResult.p90_latency_ms.toFixed(2)}ms\n`
-                    : ''}
-                  {stressTestResult.p99_latency_ms != null
-                    ? `p99: ${stressTestResult.p99_latency_ms.toFixed(2)}ms\n`
-                    : ''}
-                  {stressTestResult.max_latency_ms != null
-                    ? `max: ${stressTestResult.max_latency_ms.toFixed(2)}ms\n`
-                    : ''}
-                  {stressTestResult.stddev_latency_ms != null
-                    ? `σ:   ${stressTestResult.stddev_latency_ms.toFixed(2)}ms`
-                    : ''}
-                </pre>
-              </div>
-
-              {stressTestResult.error_breakdown && Object.keys(stressTestResult.error_breakdown).length > 0 ? (
+                <div className="result-row">
+                  <span>Target</span>
+                  <strong>{stressTestResult.target}</strong>
+                </div>
+                <div className="result-row">
+                  <span>Requests</span>
+                  <strong>{stressTestResult.requests}</strong>
+                </div>
+                <div className="result-row">
+                  <span>Successes</span>
+                  <strong>{stressTestResult.successes}</strong>
+                </div>
+                <div className="result-row">
+                  <span>Failures</span>
+                  <strong>{stressTestResult.failures}</strong>
+                </div>
+                <div className="result-row">
+                  <span>TPS</span>
+                  <strong>
+                    {stressTestResult.requests_per_second != null
+                      ? stressTestResult.requests_per_second.toFixed(1)
+                      : '—'}
+                  </strong>
+                </div>
                 <div className="result-output">
-                  <span>Error breakdown</span>
+                  <span>Latency summary</span>
                   <pre>
-                    {Object.entries(stressTestResult.error_breakdown)
-                      .map(([kind, count]) => `${kind}: ${count}`)
-                      .join('\n')}
+                    {stressTestResult.min_latency_ms != null
+                      ? `min: ${stressTestResult.min_latency_ms.toFixed(2)}ms\n`
+                      : ''}
+                    {stressTestResult.avg_latency_ms != null
+                      ? `avg: ${stressTestResult.avg_latency_ms.toFixed(2)}ms\n`
+                      : ''}
+                    {stressTestResult.p50_latency_ms != null
+                      ? `p50: ${stressTestResult.p50_latency_ms.toFixed(2)}ms\n`
+                      : ''}
+                    {stressTestResult.p90_latency_ms != null
+                      ? `p90: ${stressTestResult.p90_latency_ms.toFixed(2)}ms\n`
+                      : ''}
+                    {stressTestResult.p99_latency_ms != null
+                      ? `p99: ${stressTestResult.p99_latency_ms.toFixed(2)}ms\n`
+                      : ''}
+                    {stressTestResult.max_latency_ms != null
+                      ? `max: ${stressTestResult.max_latency_ms.toFixed(2)}ms\n`
+                      : ''}
+                    {stressTestResult.stddev_latency_ms != null
+                      ? `σ:   ${stressTestResult.stddev_latency_ms.toFixed(2)}ms`
+                      : ''}
                   </pre>
                 </div>
-              ) : null}
-            </section>
-          ) : null}
 
-          <div style={{ display: 'flex', gap: '1rem', marginTop: '1.5rem' }}>
-            <button type="submit" className="button button-primary submit-button" disabled={isSubmitting} style={{ flex: 2 }}>
-              {isSubmitting ? 'Submitting...' : 'Deploy and launch stress test'}
-            </button>
-            <button type="button" className="button button-secondary submit-button" disabled={loadingHistory} onClick={fetchHistory} style={{ flex: 1, padding: '1rem 0' }}>
-              {loadingHistory ? 'Loading...' : 'View My History'}
-            </button>
-          </div>
-        </form>
-      </section>
+                {stressTestResult.error_breakdown && Object.keys(stressTestResult.error_breakdown).length > 0 ? (
+                  <div className="result-output">
+                    <span>Error breakdown</span>
+                    <pre>
+                      {Object.entries(stressTestResult.error_breakdown)
+                        .map(([kind, count]) => `${kind}: ${count}`)
+                        .join('\n')}
+                    </pre>
+                  </div>
+                ) : null}
+              </section>
+            ) : null}
+
+            <div style={{ display: 'flex', gap: '1rem', marginTop: '1.5rem', flexWrap: 'wrap' }}>
+              <button type="submit" className="button button-primary submit-button" disabled={isSubmitting} style={{ flex: 2 }}>
+                {isSubmitting ? 'Submitting...' : 'Deploy and launch stress test'}
+              </button>
+              <button type="button" className="button button-secondary submit-button" disabled={loadingHistory} onClick={fetchHistory} style={{ flex: 1, padding: '1rem 0' }}>
+                {loadingHistory ? 'Loading...' : 'View My History'}
+              </button>
+            </div>
+          </form>
+        </section>
+      ) : (
+        <section className="panel form-card" style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center', textAlign: 'center', padding: '4rem 2rem' }}>
+          {isContestUpcoming ? (
+            <>
+              <div style={{ fontSize: '4rem', marginBottom: '1rem' }}>⏳</div>
+              <h2 style={{ color: 'var(--text-h)', marginBottom: '1rem', fontSize: '2rem' }}>Contest starting soon!</h2>
+              <p style={{ color: 'var(--text-muted)', maxWidth: '400px', margin: '0 auto 2rem', fontSize: '1.1rem', lineHeight: '1.6' }}>
+                Review the task description on the left and prepare your trading engine. Submissions will open automatically when the countdown reaches zero.
+              </p>
+              <button className="button button-secondary" onClick={fetchHistory} disabled={loadingHistory} style={{ padding: '0.75rem 2rem' }}>
+                {loadingHistory ? 'Loading...' : 'View My History'}
+              </button>
+            </>
+          ) : (
+            <>
+              <div style={{ fontSize: '4rem', marginBottom: '1rem' }}>🏁</div>
+              <h2 style={{ color: 'var(--text-h)', marginBottom: '1rem', fontSize: '2rem' }}>Contest has ended!</h2>
+              <p style={{ color: 'var(--text-muted)', maxWidth: '400px', margin: '0 auto 2rem', fontSize: '1.1rem', lineHeight: '1.6' }}>
+                Submissions are no longer accepted. Final evaluations are running on the latest submissions.
+              </p>
+              <div style={{ display: 'flex', gap: '1rem', justifyContent: 'center' }}>
+                <Link className="button button-primary" style={{ padding: '0.75rem 2rem' }} to={`/leaderboard?contest_id=${formData.contestId}`}>
+                  View Leaderboard
+                </Link>
+                <button className="button button-secondary" style={{ padding: '0.75rem 2rem' }} onClick={fetchHistory} disabled={loadingHistory}>
+                  {loadingHistory ? 'Loading...' : 'View My History'}
+                </button>
+              </div>
+            </>
+          )}
+        </section>
+      )}
 
       {showHistory && (
         <HistoryModal

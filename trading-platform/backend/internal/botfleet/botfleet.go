@@ -74,19 +74,98 @@ type Config struct {
 	FinalRound      int           // optional — which final round number (0 = not a final round)
 }
 
-// publishAsync sends a TelemetryEvent to Redis in a fire-and-forget goroutine.
-// It uses a 100ms context so a slow Redis never stalls the hot path.
+// DemoConfig exposes editable fields for host demo mode.
+// These are mapped to Config fields at runtime.
+type DemoConfig struct {
+	NumBots           int `json:"num_bots"`
+	OrdersPerSecond   int `json:"orders_per_second"`
+	RunDurationSeconds int `json:"run_duration_seconds"`
+	OrderSizeMin      int `json:"order_size_min"`
+	OrderSizeMax      int `json:"order_size_max"`
+}
+
+// DefaultDemoConfig returns light-weight defaults for host demos.
+func DefaultDemoConfig() DemoConfig {
+	return DemoConfig{
+		NumBots:           5,
+		OrdersPerSecond:   10,
+		RunDurationSeconds: 30,
+		OrderSizeMin:      1,
+		OrderSizeMax:      50,
+	}
+}
+
+// BenchmarkConfig exposes editable fields for actual benchmarking runs.
+type BenchmarkConfig struct {
+	NumBots           int `json:"num_bots"`
+	OrdersPerSecond   int `json:"orders_per_second"`
+	RunDurationSeconds int `json:"run_duration_seconds"`
+	OrderSizeMin      int `json:"order_size_min"`
+	OrderSizeMax      int `json:"order_size_max"`
+}
+
+// DefaultBenchmarkConfig returns heavy defaults for actual benchmarking.
+func DefaultBenchmarkConfig() BenchmarkConfig {
+	return BenchmarkConfig{
+		NumBots:           32,
+		OrdersPerSecond:   100,
+		RunDurationSeconds: 10,
+		OrderSizeMin:      25,
+		OrderSizeMax:      150,
+	}
+}
+
+var (
+	telemetryChan chan telemetry.TelemetryEvent
+	telemetryOnce sync.Once
+)
+
+// initTelemetryWorker starts a global background worker to batch-insert telemetry events.
+// This prevents connection pool exhaustion at high TPS (20,000+).
+func initTelemetryWorker(client *redis.Client) {
+	telemetryOnce.Do(func() {
+		telemetryChan = make(chan telemetry.TelemetryEvent, 100_000)
+		go func() {
+			var batch []telemetry.TelemetryEvent
+			ticker := time.NewTicker(50 * time.Millisecond)
+			for {
+				select {
+				case ev := <-telemetryChan:
+					batch = append(batch, ev)
+					if len(batch) >= 1000 {
+						flushBatch(client, batch)
+						batch = nil
+					}
+				case <-ticker.C:
+					if len(batch) > 0 {
+						flushBatch(client, batch)
+						batch = nil
+					}
+				}
+			}
+		}()
+	})
+}
+
+func flushBatch(client *redis.Client, batch []telemetry.TelemetryEvent) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := telemetry.PublishEventsBatch(ctx, client, batch); err != nil {
+		log.Printf("CRITICAL: dropped telemetry batch of size %d: %v", len(batch), err)
+	}
+}
+
+// publishAsync pushes a TelemetryEvent to the global channel.
 func publishAsync(client *redis.Client, event telemetry.TelemetryEvent) {
 	if client == nil {
 		return
 	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer cancel()
-		if err := telemetry.PublishEvent(ctx, client, event); err != nil {
-			log.Printf("CRITICAL: dropped telemetry event %s seq %d: %v", event.SubmissionID, event.Sequence, err)
-		}
-	}()
+	initTelemetryWorker(client)
+	select {
+	case telemetryChan <- event:
+	default:
+		log.Printf("CRITICAL: telemetry channel full, dropped event %s seq %d", event.SubmissionID, event.Sequence)
+	}
 }
 
 type Order struct {

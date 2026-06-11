@@ -31,14 +31,14 @@ fi
 echo "✅ Docker image built successfully"
 
 echo "🚀 Applying Kubernetes namespace and RBAC..."
-kubectl apply -f infrastructure/k8s-namespace.yaml
+kubectl apply -f trading-platform/infrastructure/k8s-namespace.yaml
 if [ $? -ne 0 ]; then
     echo "❌ Failed to apply namespace configuration!"
     exit 1
 fi
 
 echo "🚀 Deploying backend to Kubernetes..."
-kubectl apply -f infrastructure/backend-deployment.yaml
+kubectl apply -f trading-platform/infrastructure/backend-deployment.yaml
 if [ $? -ne 0 ]; then
     echo "❌ Failed to deploy backend!"
     exit 1

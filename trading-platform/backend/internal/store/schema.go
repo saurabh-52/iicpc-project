@@ -31,16 +31,23 @@ type SubmissionResult struct {
 	FinalRound       *int            `json:"final_round,omitempty"`
 	SeedUsed         int64           `json:"seed_used"`
 	UserID           string          `json:"user_id"`
+	Username         string          `json:"username"`
+	SourceCode       string          `json:"source_code,omitempty"`
 }
 
 // ContestFinalScore represents a post-contest averaged score for a team.
 type ContestFinalScore struct {
 	ContestID   string          `json:"contest_id"`
 	SystemName  string          `json:"system_name"`
-	AvgScore    float64         `json:"avg_score"`
-	RoundScores json.RawMessage `json:"round_scores"`
-	FinalGrade  string          `json:"final_grade"`
-	FinalizedAt time.Time       `json:"finalized_at"`
+	AvgScore       float64         `json:"avg_score"`
+	AvgLatency     float64         `json:"latency_score"`
+	AvgThroughput  float64         `json:"throughput_score"`
+	AvgCorrectness float64         `json:"correctness_score"`
+	AvgP99         float64         `json:"p99_latency_ms"`
+	AvgTPS         float64         `json:"tps"`
+	RoundScores    json.RawMessage `json:"round_scores"`
+	FinalGrade     string          `json:"final_grade"`
+	FinalizedAt    time.Time       `json:"finalized_at"`
 }
 
 // User represents a registered user account.
@@ -165,6 +172,11 @@ CREATE TABLE IF NOT EXISTS contest_final_scores (
 	contest_id    TEXT NOT NULL REFERENCES contests(id) ON DELETE CASCADE,
 	system_name   TEXT NOT NULL,
 	avg_score     FLOAT8 NOT NULL DEFAULT 0,
+	avg_latency     FLOAT8 NOT NULL DEFAULT 0,
+	avg_throughput  FLOAT8 NOT NULL DEFAULT 0,
+	avg_correctness FLOAT8 NOT NULL DEFAULT 0,
+	avg_p99         FLOAT8 NOT NULL DEFAULT 0,
+	avg_tps         FLOAT8 NOT NULL DEFAULT 0,
 	round_scores  JSONB NOT NULL DEFAULT '[]',
 	final_grade   TEXT NOT NULL DEFAULT 'F',
 	finalized_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -181,6 +193,13 @@ ALTER TABLE contest_registrations ADD COLUMN IF NOT EXISTS user_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_submission_results_user_id
 ON submission_results (user_id, submitted_at DESC);
 
+-- Indexes for User Profile queries
+CREATE INDEX IF NOT EXISTS idx_submission_results_profile_best
+ON submission_results (user_id, judging_mode, total_score DESC);
+
+CREATE INDEX IF NOT EXISTS idx_submission_results_profile_history
+ON submission_results (user_id, judging_mode, submitted_at DESC);
+
 -- Track who created/published each contest
 ALTER TABLE contests ADD COLUMN IF NOT EXISTS created_by TEXT NOT NULL DEFAULT '';
 
@@ -191,7 +210,7 @@ ON contest_registrations (user_id, contest_id);
 
 // NewSubmissionResult builds a SubmissionResult from scoring outputs.
 func NewSubmissionResult(
-	submissionID, systemName, strategy, language, userID string,
+	submissionID, systemName, strategy, language, userID, sourceCode string,
 	sc scorer.Score,
 	metrics scorer.PerformanceMetrics,
 	val validator.ValidationResult,
@@ -218,12 +237,13 @@ func NewSubmissionResult(
 		RawValidation:    rawValidation,
 		JudgingMode:      "practice",
 		UserID:           userID,
+		SourceCode:       sourceCode,
 	}
 }
 
 // NewSubmissionResultWithMode builds a SubmissionResult with explicit judging mode and contest metadata.
 func NewSubmissionResultWithMode(
-	submissionID, systemName, strategy, language, userID string,
+	submissionID, systemName, strategy, language, userID, sourceCode string,
 	sc scorer.Score,
 	metrics scorer.PerformanceMetrics,
 	val validator.ValidationResult,
@@ -231,7 +251,7 @@ func NewSubmissionResultWithMode(
 	finalRound *int,
 	seedUsed int64,
 ) SubmissionResult {
-	sr := NewSubmissionResult(submissionID, systemName, strategy, language, userID, sc, metrics, val)
+	sr := NewSubmissionResult(submissionID, systemName, strategy, language, userID, sourceCode, sc, metrics, val)
 	sr.JudgingMode = judgingMode
 	sr.ContestID = contestID
 	sr.FinalRound = finalRound

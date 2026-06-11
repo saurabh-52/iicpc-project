@@ -22,6 +22,7 @@ const strategyTabs = [
 ];
 
 function displayName(entry) {
+  if (entry.username && entry.username.trim()) return entry.username;
   if (entry.system_name && entry.system_name.trim()) return entry.system_name;
   return entry.submission_id?.slice(0, 18) || '—';
 }
@@ -170,6 +171,7 @@ export default function Leaderboard() {
   const [error, setError] = useState(null);
   const [selected, setSelected] = useState(null);
   const [activeStrategy, setActiveStrategy] = useState('bbo_heavy');
+  const [contestName, setContestName] = useState('');
   const [modeFilter, setModeFilter] = useState('all'); // 'all' | 'practice' | 'contest_live' | 'contest_final'
   const { connected, updateTrigger } = useWebSocket();
 
@@ -201,11 +203,11 @@ export default function Leaderboard() {
             total_score: e.avg_score || 0,
             grade: e.final_grade || 'F',
             submission_id: `final-${e.system_name}`,
-            latency_score: 0,
-            throughput_score: 0,
-            correctness_score: 0,
-            p99_latency_ms: 0,
-            tps: 0,
+            latency_score: e.latency_score || 0,
+            throughput_score: e.throughput_score || 0,
+            correctness_score: e.correctness_score || 0,
+            p99_latency_ms: e.p99_latency_ms || 0,
+            tps: e.tps || 0,
             cross_events: 0,
             orders_processed: 0,
             strategy: 'Combined Final',
@@ -228,7 +230,20 @@ export default function Leaderboard() {
   // Fetch on load, on strategy change, or on live websocket update
   useEffect(() => {
     fetchLeaderboard(activeStrategy);
-  }, [activeStrategy, updateTrigger, contestId]);
+
+    if (isContestMode) {
+      fetch('/api/contests')
+        .then(res => res.ok ? res.json() : Promise.reject())
+        .then(data => {
+          const contests = data.contests || [];
+          const contest = contests.find(c => c.id === contestId);
+          if (contest) {
+            setContestName(contest.name);
+          }
+        })
+        .catch(() => {});
+    }
+  }, [activeStrategy, updateTrigger, isContestMode, contestId]);
 
   const displayEntries = modeFilter === 'all'
     ? entries
@@ -264,7 +279,7 @@ export default function Leaderboard() {
       <div className="leaderboard-header panel">
         <div className="leaderboard-header-copy">
           <span className="section-tag">Leaderboard</span>
-          <h2>{isContestMode ? `Contest Leaderboard: ${contestId}` : 'Trading Engine Rankings'}</h2>
+          <h2>{isContestMode ? `Contest Leaderboard: ${contestName || contestId}` : 'Trading Engine Rankings'}</h2>
           <p>
             {isContestMode 
               ? 'Real-time scores for this specific contest. Ranks are determined by the contest rules.'
@@ -272,8 +287,8 @@ export default function Leaderboard() {
           </p>
         </div>
         <div className="leaderboard-status">
-          <span className={`status-pill ${connected ? 'success' : 'offline'}`}>
-            {connected ? '● Live' : '○ Offline'}
+          <span className={`status-pill ${modeFilter === 'contest_final' ? 'offline' : (connected ? 'success' : 'offline')}`}>
+            {modeFilter === 'contest_final' ? '● Finalized' : (connected ? '● Live' : '○ Offline')}
           </span>
           <span className="entry-count">{displayEntries.length} submissions</span>
         </div>
@@ -395,7 +410,9 @@ export default function Leaderboard() {
               </thead>
               <tbody>
                 {displayEntries.map((entry, i) => {
-                  const isMe = user && entry.system_name === user.username;
+                  const entryName = entry.username || entry.system_name;
+                  const isMe = user && entryName === user.username;
+                  const isFinal = (entry.judging_mode || 'practice') === 'contest_final';
                   return (
                   <tr
                     key={entry.submission_id}
