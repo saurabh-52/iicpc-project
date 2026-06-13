@@ -3,6 +3,7 @@ import { useLocation } from 'react-router-dom';
 import useWebSocket from '../hooks/useWebSocket';
 import { useAuth } from '../context/AuthContext';
 
+/* ── Constants ── */
 const gradeColors = {
   S: { bg: 'linear-gradient(135deg, #fbbf24, #f59e0b)', color: '#78350f', glow: 'rgba(251,191,36,0.3)' },
   A: { bg: 'linear-gradient(135deg, #34d399, #10b981)', color: '#064e3b', glow: 'rgba(52,211,153,0.3)' },
@@ -21,26 +22,19 @@ const strategyTabs = [
   { value: 'momentum_burst', label: 'Momentum Burst' },
 ];
 
+const PROBLEM_ACCENTS = [
+  { color: '#3b82f6', bg: 'rgba(59,130,246,0.06)', border: 'rgba(59,130,246,0.18)', gradient: 'linear-gradient(135deg, rgba(59,130,246,0.08), rgba(59,130,246,0.02))' },
+  { color: '#8b5cf6', bg: 'rgba(139,92,246,0.06)', border: 'rgba(139,92,246,0.18)', gradient: 'linear-gradient(135deg, rgba(139,92,246,0.08), rgba(139,92,246,0.02))' },
+  { color: '#10b981', bg: 'rgba(16,185,129,0.06)', border: 'rgba(16,185,129,0.18)', gradient: 'linear-gradient(135deg, rgba(16,185,129,0.08), rgba(16,185,129,0.02))' },
+  { color: '#f59e0b', bg: 'rgba(245,158,11,0.06)', border: 'rgba(245,158,11,0.18)', gradient: 'linear-gradient(135deg, rgba(245,158,11,0.08), rgba(245,158,11,0.02))' },
+  { color: '#ec4899', bg: 'rgba(236,72,153,0.06)', border: 'rgba(236,72,153,0.18)', gradient: 'linear-gradient(135deg, rgba(236,72,153,0.08), rgba(236,72,153,0.02))' },
+];
+
+/* ── Helpers ── */
 function displayName(entry) {
   if (entry.username && entry.username.trim()) return entry.username;
   if (entry.system_name && entry.system_name.trim()) return entry.system_name;
   return entry.submission_id?.slice(0, 18) || '—';
-}
-
-function GradeBadge({ grade }) {
-  const style = gradeColors[grade] || gradeColors.F;
-  return (
-    <span
-      className="grade-badge"
-      style={{
-        background: style.bg,
-        color: style.color,
-        boxShadow: `0 4px 16px ${style.glow}`,
-      }}
-    >
-      {grade}
-    </span>
-  );
 }
 
 function formatLatency(ms) {
@@ -55,8 +49,34 @@ function formatTPS(tps) {
 }
 
 function strategyLabel(strategy) {
+  if (!strategy) return 'Common';
   const found = strategyTabs.find(t => t.value === strategy);
   return found ? found.label : strategy || '—';
+}
+
+function getModeInfo(mode) {
+  switch (mode) {
+    case 'contest_final': return { emoji: '🏁', label: 'Final', bg: 'rgba(16,185,129,0.08)', color: '#059669' };
+    case 'contest_live': return { emoji: '🔴', label: 'Live', bg: 'rgba(239,68,68,0.08)', color: '#dc2626' };
+    default: return { emoji: '⚡', label: 'Practice', bg: 'rgba(99,102,241,0.08)', color: '#6366f1' };
+  }
+}
+
+/* ── Small Components ── */
+function GradeBadge({ grade }) {
+  const style = gradeColors[grade] || gradeColors.F;
+  return (
+    <span
+      className="grade-badge"
+      style={{
+        background: style.bg,
+        color: style.color,
+        boxShadow: `0 4px 16px ${style.glow}`,
+      }}
+    >
+      {grade}
+    </span>
+  );
 }
 
 function ScoreBar({ label, value, max, color }) {
@@ -77,10 +97,11 @@ function ScoreBar({ label, value, max, color }) {
   );
 }
 
+/* ── Submission Detail Modal ── */
 function SubmissionDetail({ submission, onClose }) {
   if (!submission) return null;
   return (
-    <div className="detail-overlay" onClick={onClose}>
+    <div className="detail-overlay" onClick={onClose} style={{ zIndex: 110 }}>
       <article className="detail-card panel" onClick={e => e.stopPropagation()}>
         <div className="detail-header">
           <div>
@@ -110,9 +131,9 @@ function SubmissionDetail({ submission, onClose }) {
               </div>
             ) : (
               <>
-                <ScoreBar label="Latency" value={submission.latency_score} max={50} color="#3b82f6" />
-                <ScoreBar label="Throughput" value={submission.throughput_score} max={30} color="#10b981" />
-                <ScoreBar label="Correctness" value={submission.correctness_score} max={20} color="#f59e0b" />
+                <ScoreBar label="Latency" value={submission.latency_score} max={25} color="#3b82f6" />
+                <ScoreBar label="Throughput" value={submission.throughput_score} max={25} color="#10b981" />
+                <ScoreBar label="Correctness" value={submission.correctness_score} max={50} color="#f59e0b" />
               </>
             )}
           </div>
@@ -164,15 +185,354 @@ function SubmissionDetail({ submission, onClose }) {
   );
 }
 
+function AssignGradeJS(total) {
+  if (total >= 90) return "S";
+  if (total >= 75) return "A";
+  if (total >= 60) return "B";
+  if (total >= 45) return "C";
+  return "F";
+}
+
+/* ── Final Problem Detail Modal ── */
+function FinalProblemDetailModal({ problem, onClose }) {
+  if (!problem) return null;
+
+  const avgGrade = AssignGradeJS(problem.averageScore);
+
+  return (
+    <div className="detail-overlay" onClick={onClose} style={{ zIndex: 110 }}>
+      <article className="detail-card panel" onClick={e => e.stopPropagation()} style={{ maxWidth: '520px' }}>
+        {/* Header */}
+        <div className="detail-header" style={{ marginBottom: '1.25rem' }}>
+          <div>
+            <span className="section-tag">Problem Detail</span>
+            <h3 style={{ fontSize: '1.15rem', margin: '0.3rem 0 0' }}>
+              {problem.problem_code ? `${problem.problem_code} - ${problem.problem_title}` : problem.problem_title}
+            </h3>
+          </div>
+          <button className="detail-close" onClick={onClose} aria-label="Close">✕</button>
+        </div>
+
+        {/* Problem Summary / Average Score Banner */}
+        <div style={{
+          marginBottom: '1.5rem',
+          padding: '1.25rem 1.5rem',
+          borderRadius: '1rem',
+          background: 'linear-gradient(135deg, rgba(99,102,241,0.06), rgba(139,92,246,0.04))',
+          border: '1px solid rgba(99,102,241,0.12)',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '1rem',
+        }}>
+          <GradeBadge grade={avgGrade} />
+          <div>
+            <div style={{ fontSize: '1.75rem', fontWeight: 800, color: 'var(--text-h)', letterSpacing: '-0.03em', lineHeight: 1 }}>
+              {problem.averageScore.toFixed(1)}
+            </div>
+            <div style={{ fontSize: '0.75rem', fontWeight: 600, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.08em', marginTop: '0.2rem' }}>
+              Average Score · {problem.rounds.length} Evaluated Strateg{problem.rounds.length !== 1 ? 'ies' : 'y'}
+            </div>
+          </div>
+        </div>
+
+        {/* List of strategy scores */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+          <strong style={{ fontSize: '0.85rem', color: 'var(--text-dim)', marginBottom: '0.25rem' }}>
+            Evaluated Strategies
+          </strong>
+          {problem.rounds.map((r, i) => {
+            const accent = PROBLEM_ACCENTS[i % PROBLEM_ACCENTS.length];
+            return (
+              <div
+                key={i}
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  padding: '1rem 1.25rem',
+                  borderRadius: '0.875rem',
+                  background: accent.gradient,
+                  border: `1px solid ${accent.border}`,
+                }}
+              >
+                <div>
+                  <div style={{ fontSize: '0.92rem', fontWeight: 700, color: 'var(--text-h)' }}>
+                    {strategyLabel(r.strategy)}
+                  </div>
+                  <div style={{ fontSize: '0.78rem', color: 'var(--text-dim)', marginTop: '0.15rem' }}>
+                    {r.label || 'Deterministic run'}
+                  </div>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.875rem' }}>
+                  <div style={{ textAlign: 'right' }}>
+                    <div style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-h)' }}>
+                      {r.score != null ? r.score.toFixed(1) : '0.0'}
+                    </div>
+                    <div style={{ fontSize: '0.7rem', color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                      Score
+                    </div>
+                  </div>
+                  <GradeBadge grade={r.grade || 'F'} />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </article>
+    </div>
+  );
+}
+
+/* ── Contestant Submissions Modal (Contest drill-down) ── */
+function ContestantSubmissionsModal({ contestant, onClose, onViewSubmission, onViewFinalProblem }) {
+  if (!contestant) return null;
+
+  let problems = [];
+  const isFinal = (contestant.judging_mode || 'practice') === 'contest_final';
+
+  if (isFinal) {
+    const rawRounds = contestant.round_scores || [];
+    const groupedMap = {};
+    const groupedList = [];
+    rawRounds.forEach(r => {
+      if (r.problem_code === 'Live' || (r.label && r.label.toLowerCase().includes('best live'))) {
+        return;
+      }
+      const code = r.problem_code || 'Unknown';
+      if (!groupedMap[code]) {
+        groupedMap[code] = {
+          problem_code: code,
+          problem_title: r.problem_title || 'Unknown Problem',
+          rounds: [],
+          key: code,
+        };
+        groupedList.push(groupedMap[code]);
+      }
+      groupedMap[code].rounds.push(r);
+    });
+
+    groupedList.forEach(g => {
+      const sum = g.rounds.reduce((acc, r) => acc + (r.score || 0), 0);
+      g.averageScore = g.rounds.length > 0 ? sum / g.rounds.length : 0;
+    });
+
+    problems = groupedList;
+  } else {
+    try {
+      const parsed = typeof contestant.raw_metrics === 'string'
+        ? JSON.parse(contestant.raw_metrics)
+        : contestant.raw_metrics;
+      if (Array.isArray(parsed)) {
+        problems = parsed;
+      }
+    } catch (e) {
+      console.error("Failed to parse raw_metrics for contestant", e);
+    }
+  }
+
+  const totalScore = (contestant.total_score || 0).toFixed(1);
+  const gradeStyle = gradeColors[contestant.grade] || gradeColors.F;
+
+  return (
+    <div className="detail-overlay" onClick={onClose}>
+      <article className="detail-card panel" onClick={e => e.stopPropagation()} style={{ maxWidth: '580px' }}>
+        {/* Header */}
+        <div className="detail-header" style={{ marginBottom: '0' }}>
+          <div>
+            <span className="section-tag">Contestant Breakdown</span>
+            <h3 style={{ fontSize: '1.15rem', margin: '0.3rem 0 0' }}>{displayName(contestant)}</h3>
+          </div>
+          <button className="detail-close" onClick={onClose} aria-label="Close">✕</button>
+        </div>
+
+        {/* Score Summary Banner */}
+        <div style={{
+          margin: '1.25rem 0',
+          padding: '1.25rem 1.5rem',
+          borderRadius: '1rem',
+          background: 'linear-gradient(135deg, rgba(99,102,241,0.06), rgba(139,92,246,0.04))',
+          border: '1px solid rgba(99,102,241,0.12)',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '1rem',
+        }}>
+          <GradeBadge grade={contestant.grade} />
+          <div>
+            <div style={{ fontSize: '2rem', fontWeight: 800, color: 'var(--text-h)', letterSpacing: '-0.03em', lineHeight: 1 }}>
+              {totalScore}
+            </div>
+            <div style={{ fontSize: '0.78rem', fontWeight: 600, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.08em', marginTop: '0.2rem' }}>
+              Total Score · {problems.length} Problem{problems.length !== 1 ? 's' : ''}
+            </div>
+          </div>
+        </div>
+
+        {/* Problem Cards */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+          {problems.length === 0 ? (
+            <div style={{
+              textAlign: 'center',
+              padding: '2.5rem 1rem',
+              color: '#94a3b8',
+              fontSize: '0.9rem',
+              borderRadius: '0.75rem',
+              background: 'rgba(15,23,42,0.02)',
+              border: '1px dashed rgba(148,163,184,0.25)',
+            }}>
+              <div style={{ fontSize: '2rem', marginBottom: '0.5rem' }}>📭</div>
+              No problem data available.
+            </div>
+          ) : (
+            problems.map((p, i) => {
+              const accent = PROBLEM_ACCENTS[i % PROBLEM_ACCENTS.length];
+              const problemName = isFinal
+                ? p.problem_code && p.problem_title
+                  ? `${p.problem_code} - ${p.problem_title}`
+                  : p.problem_title || 'Unknown Problem'
+                : p.problem_code && p.problem_title
+                  ? `${p.problem_code} - ${p.problem_title}`
+                  : (p.problem_id || `Problem ${i + 1}`);
+              const score = isFinal ? p.averageScore : p.total_score;
+
+              return (
+                <div
+                  key={i}
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    padding: '1rem 1.25rem',
+                    borderRadius: '0.875rem',
+                    background: accent.gradient,
+                    border: `1px solid ${accent.border}`,
+                    transition: 'transform 180ms ease, box-shadow 180ms ease',
+                    cursor: 'pointer',
+                  }}
+                  onMouseOver={(e) => {
+                    e.currentTarget.style.transform = 'translateY(-2px)';
+                    e.currentTarget.style.boxShadow = `0 8px 24px ${accent.border}`;
+                  }}
+                  onMouseOut={(e) => {
+                    e.currentTarget.style.transform = 'translateY(0)';
+                    e.currentTarget.style.boxShadow = 'none';
+                  }}
+                  onClick={() => {
+                    if (isFinal) {
+                      onViewFinalProblem(p);
+                    } else {
+                      onViewSubmission(p);
+                    }
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.875rem', minWidth: 0 }}>
+                    {/* Problem number circle */}
+                    {!isFinal && (
+                      <div style={{
+                        width: '2.25rem',
+                        height: '2.25rem',
+                        borderRadius: '0.625rem',
+                        background: accent.color,
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        color: '#fff',
+                        fontWeight: 800,
+                        fontSize: '0.85rem',
+                        flexShrink: 0,
+                        boxShadow: `0 4px 12px ${accent.border}`,
+                      }}>
+                        {p.problem_code || String.fromCharCode(65 + i)}
+                      </div>
+                    )}
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{
+                        fontSize: '0.92rem',
+                        fontWeight: 700,
+                        color: 'var(--text-h)',
+                        whiteSpace: 'nowrap',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                      }}>
+                        {problemName}
+                      </div>
+                      <div style={{
+                        fontSize: '0.78rem',
+                        fontWeight: 600,
+                        color: accent.color,
+                        marginTop: '0.15rem',
+                        letterSpacing: '0.03em',
+                      }}>
+                        {isFinal
+                          ? `Final Score: ${score != null ? score.toFixed(1) : '—'}`
+                          : `Score: ${score != null ? score.toFixed(1) : '—'}`}
+                      </div>
+                    </div>
+                  </div>
+
+                  {isFinal ? (
+                    <span style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.25rem',
+                      fontWeight: 600,
+                      fontSize: '0.78rem',
+                      color: accent.color,
+                    }}>
+                      View Details →
+                    </span>
+                  ) : (
+                    <button
+                      onClick={(e) => { e.stopPropagation(); onViewSubmission(p); }}
+                      style={{
+                        padding: '0.4rem 0.85rem',
+                        borderRadius: '0.5rem',
+                        border: `1px solid ${accent.border}`,
+                        background: accent.bg,
+                        color: accent.color,
+                        fontWeight: 600,
+                        fontSize: '0.78rem',
+                        cursor: 'pointer',
+                        transition: 'all 180ms ease',
+                        whiteSpace: 'nowrap',
+                        flexShrink: 0,
+                      }}
+                      onMouseOver={(e) => {
+                        e.currentTarget.style.background = accent.color;
+                        e.currentTarget.style.color = '#fff';
+                        e.currentTarget.style.borderColor = accent.color;
+                      }}
+                      onMouseOut={(e) => {
+                        e.currentTarget.style.background = accent.bg;
+                        e.currentTarget.style.color = accent.color;
+                        e.currentTarget.style.borderColor = accent.border;
+                      }}
+                    >
+                      View Submission
+                    </button>
+                  )}
+                </div>
+              );
+            })
+          )}
+        </div>
+      </article>
+    </div>
+  );
+}
+
+/* ── Main Leaderboard Page ── */
 export default function Leaderboard() {
   const { user } = useAuth();
   const [entries, setEntries] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [selected, setSelected] = useState(null);
+  const [selectedContestant, setSelectedContestant] = useState(null);
+  const [selectedFinalProblem, setSelectedFinalProblem] = useState(null);
   const [activeStrategy, setActiveStrategy] = useState('bbo_heavy');
   const [contestName, setContestName] = useState('');
   const [modeFilter, setModeFilter] = useState('all'); // 'all' | 'practice' | 'contest_live' | 'contest_final'
+  const [contestPhase, setContestPhase] = useState('');
   const { connected, updateTrigger } = useWebSocket();
 
   const location = useLocation();
@@ -185,7 +545,7 @@ export default function Leaderboard() {
     const params = new URLSearchParams({ limit: '50' });
     if (strategy && !isContestMode) params.set('strategy', strategy);
 
-    const endpoint = isContestMode 
+    const endpoint = isContestMode
       ? `/api/contests/${contestId}/leaderboard?${params.toString()}`
       : `/api/leaderboard?${params.toString()}`;
 
@@ -216,8 +576,13 @@ export default function Leaderboard() {
           }));
         }
         setEntries(fetchedEntries);
-        if (isContestMode && data.type) {
-          setModeFilter(data.type === 'final' ? 'contest_final' : 'contest_live');
+        if (isContestMode) {
+          setContestPhase(data.phase || '');
+          if (data.type) {
+            setModeFilter(data.type === 'final' ? 'contest_final' : 'contest_live');
+          }
+        } else {
+          setContestPhase('');
         }
         setLoading(false);
       })
@@ -281,50 +646,50 @@ export default function Leaderboard() {
           <span className="section-tag">Leaderboard</span>
           <h2>{isContestMode ? `Contest Leaderboard: ${contestName || contestId}` : 'Trading Engine Rankings'}</h2>
           <p>
-            {isContestMode 
+            {isContestMode
               ? 'Real-time scores for this specific contest. Ranks are determined by the contest rules.'
               : 'Real-time scores from benchmarked submissions. Engines are ranked by composite score across latency, throughput, and correctness.'}
           </p>
         </div>
         <div className="leaderboard-status">
-          <span className={`status-pill ${modeFilter === 'contest_final' ? 'offline' : (connected ? 'success' : 'offline')}`}>
-            {modeFilter === 'contest_final' ? '● Finalized' : (connected ? '● Live' : '○ Offline')}
+          <span
+            className={`status-pill ${
+              isContestMode && contestPhase === 'finalizing'
+                ? ''
+                : modeFilter === 'contest_final'
+                  ? 'offline'
+                  : (connected ? 'success' : 'offline')
+            }`}
+            style={
+              isContestMode && contestPhase === 'finalizing'
+                ? { background: 'rgba(245, 158, 11, 0.18)', color: '#b45309' }
+                : {}
+            }
+          >
+            {isContestMode && contestPhase === 'finalizing'
+              ? '● Finalizing...'
+              : modeFilter === 'contest_final'
+                ? '● Finalized'
+                : (connected ? '● Live' : '○ Offline')}
           </span>
-          <span className="entry-count">{displayEntries.length} submissions</span>
+          <span className="entry-count">
+            {isContestMode && contestPhase === 'finalizing' ? '0' : displayEntries.length} submissions
+          </span>
         </div>
       </div>
 
       {!isContestMode && (
-        <>
-          <div className="strategy-tabs panel" style={{ marginBottom: '0.5rem' }}>
-            {[
-              { value: 'all', label: '📊 All' },
-              { value: 'practice', label: '⚡ Practice' },
-              { value: 'contest_live', label: '🔴 Contest Live' },
-              { value: 'contest_final', label: '🏁 Contest Final' },
-            ].map(tab => (
-              <button
-                key={tab.value}
-                className={`strategy-tab ${modeFilter === tab.value ? 'active' : ''}`}
-                onClick={() => setModeFilter(tab.value)}
-              >
-                {tab.label}
-              </button>
-            ))}
-          </div>
-
-          <div className="strategy-tabs panel">
-            {strategyTabs.map(tab => (
-              <button
-                key={tab.value}
-                className={`strategy-tab ${activeStrategy === tab.value ? 'active' : ''}`}
-                onClick={() => handleStrategyChange(tab.value)}
-              >
-                {tab.label}
-              </button>
-            ))}
-          </div>
-        </>
+        <div className="strategy-tabs panel">
+          {strategyTabs.map(tab => (
+            <button
+              key={tab.value}
+              className={`strategy-tab ${activeStrategy === tab.value ? 'active' : ''}`}
+              onClick={() => handleStrategyChange(tab.value)}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
       )}
 
       <details className="scoring-info panel">
@@ -334,13 +699,13 @@ export default function Leaderboard() {
             <span>S<sub>Total</sub></span> = S<sub>L</sub> + S<sub>T</sub> + S<sub>C</sub>
           </div>
           <div className="math-formula">
-            <span>S<sub>L</sub> (Latency)</span> = 50 × max(0, min(1, (100 - P99) / 95))
+            <span>S<sub>L</sub> (Latency)</span> = 25 × max(0, min(1, (100 - P99) / 95))
           </div>
           <div className="math-formula">
-            <span>S<sub>T</sub> (Throughput)</span> = 30 × max(0, min(1, (TPS - 100) / 4900))
+            <span>S<sub>T</sub> (Throughput)</span> = 25 × max(0, min(1, (TPS - 100) / 4900))
           </div>
           <div className="math-formula">
-            <span>S<sub>C</sub> (Correctness)</span> = 20 × max(0, 1 - (Crosses / Orders))
+            <span>S<sub>C</sub> (Correctness)</span> = 50 × max(0, 1 - (Crosses / Orders))
           </div>
         </div>
       </details>
@@ -351,7 +716,22 @@ export default function Leaderboard() {
         </div>
       )}
 
-      {displayEntries.length === 0 && !error ? (
+      {isContestMode && contestPhase === 'finalizing' ? (
+        <div className="leaderboard-empty panel" style={{
+          background: 'linear-gradient(135deg, rgba(99,102,241,0.03), rgba(139,92,246,0.02))',
+          border: '1px solid rgba(99,102,241,0.15)',
+          padding: '5rem 2rem',
+          textAlign: 'center',
+          borderRadius: '1.25rem'
+        }}>
+          <div className="spinner" style={{ margin: '0 auto 1.5rem', width: '3rem', height: '3rem', borderWidth: '3.5px' }} />
+          <h3 style={{ fontSize: '1.4rem', color: 'var(--text-h)', margin: '0 0 0.5rem 0', fontWeight: '700' }}>Finalizing Standings</h3>
+          <p style={{ color: '#64748b', maxWidth: '500px', margin: '0 auto', fontSize: '0.92rem', lineHeight: '1.6' }}>
+            The contest has ended! The host is currently running the final post-contest evaluation rounds. 
+            The finalized leaderboard standings will appear here shortly.
+          </p>
+        </div>
+      ) : displayEntries.length === 0 && !error ? (
         <div className="leaderboard-empty panel">
           <div className="empty-icon">🏁</div>
           <h3>No submissions yet</h3>
@@ -372,7 +752,13 @@ export default function Leaderboard() {
                 <article
                   key={entry.submission_id}
                   className={`podium-card panel podium-${i + 1}`}
-                  onClick={() => setSelected(entry)}
+                  onClick={() => {
+                    if (isContestMode) {
+                      setSelectedContestant(entry);
+                    } else {
+                      setSelected(entry);
+                    }
+                  }}
                 >
                   <div className="podium-rank">{getRankEmoji(i)}</div>
                   <GradeBadge grade={entry.grade} />
@@ -382,6 +768,14 @@ export default function Leaderboard() {
                     <span>{formatTPS(entry.tps)} TPS</span>
                   </div>
                   <span className="podium-id">{displayName(entry)}</span>
+                  {isContestMode && modeFilter === 'contest_final' && (
+                    <div style={{ fontSize: '0.75rem', color: '#4f46e5', fontWeight: 600, marginTop: '0.25rem', marginBottom: '-0.15rem' }}>
+                      Best Live: {(() => {
+                        const bestLiveRound = (entry.round_scores || []).find(r => (r.problem_code === 'Live') || (r.label && r.label.startsWith('Best Live')));
+                        return bestLiveRound && bestLiveRound.score != null ? bestLiveRound.score.toFixed(1) : '—';
+                      })()}
+                    </div>
+                  )}
                   {entry.strategy && (
                     <span className="podium-strategy">{strategyLabel(entry.strategy)}</span>
                   )}
@@ -396,11 +790,12 @@ export default function Leaderboard() {
               <thead>
                 <tr>
                   <th>Rank</th>
-                  <th>Engine</th>
-                  <th>Mode</th>
+                  <th>{isContestMode ? 'Username' : 'Engine'}</th>
+                  {!isContestMode && <th>Mode</th>}
                   <th>Strategy</th>
                   <th>Grade</th>
                   <th>Score</th>
+                  {isContestMode && modeFilter === 'contest_final' && <th>Best Live</th>}
                   <th>Latency</th>
                   <th>Throughput</th>
                   <th>Correctness</th>
@@ -412,46 +807,57 @@ export default function Leaderboard() {
                 {displayEntries.map((entry, i) => {
                   const entryName = entry.username || entry.system_name;
                   const isMe = user && entryName === user.username;
-                  const isFinal = (entry.judging_mode || 'practice') === 'contest_final';
+                  const mode = getModeInfo(entry.judging_mode || 'practice');
                   return (
-                  <tr
-                    key={entry.submission_id}
-                    className={`lb-row ${i < 3 ? 'lb-row-top' : ''} ${isMe ? 'lb-row-me' : ''}`}
-                    onClick={() => setSelected(entry)}
-                  >
-                    <td className="rank-cell">{getRankEmoji(i)}</td>
-                    <td className="id-cell" title={entry.submission_id}>
-                      {displayName(entry)}
-                    </td>
-                    <td>
-                      <span style={{
-                        fontSize: '0.7rem',
-                        padding: '2px 6px',
-                        borderRadius: '4px',
-                        fontWeight: 600,
-                        background: (entry.judging_mode || 'practice') === 'practice'
-                          ? 'rgba(99, 102, 241, 0.1)'
-                          : (entry.judging_mode || 'practice') === 'contest_final'
-                          ? 'rgba(34, 197, 94, 0.1)'
-                          : 'rgba(239, 68, 68, 0.1)',
-                        color: (entry.judging_mode || 'practice') === 'practice'
-                          ? '#6366f1'
-                          : (entry.judging_mode || 'practice') === 'contest_final'
-                          ? '#22c55e'
-                          : '#ef4444',
-                      }}>
-                        {(entry.judging_mode || 'practice') === 'practice' ? '⚡' : (entry.judging_mode || 'practice') === 'contest_final' ? '🏁' : '🔴'}
-                      </span>
-                    </td>
-                    <td className="strategy-cell">{strategyLabel(entry.strategy)}</td>
-                    <td><GradeBadge grade={entry.grade} /></td>
-                    <td className="score-cell">{entry.total_score.toFixed(1)}</td>
-                    <td>{entry.latency_score.toFixed(1)}<span className="dim">/50</span></td>
-                    <td>{entry.throughput_score.toFixed(1)}<span className="dim">/30</span></td>
-                    <td>{entry.correctness_score.toFixed(1)}<span className="dim">/20</span></td>
-                    <td>{formatLatency(entry.p99_latency_ms)}</td>
-                    <td>{formatTPS(entry.tps)}</td>
-                  </tr>
+                    <tr
+                      key={entry.submission_id}
+                      className={`lb-row ${i < 3 ? 'lb-row-top' : ''} ${isMe ? 'lb-row-me' : ''}`}
+                      onClick={() => {
+                        if (isContestMode) {
+                          setSelectedContestant(entry);
+                        } else {
+                          setSelected(entry);
+                        }
+                      }}
+                    >
+                      <td className="rank-cell">{getRankEmoji(i)}</td>
+                      <td className="id-cell" title={entry.submission_id}>
+                        {displayName(entry)}
+                      </td>
+                      {!isContestMode && (
+                        <td>
+                          <span style={{
+                            fontSize: '0.72rem',
+                            padding: '0.2rem 0.5rem',
+                            borderRadius: '6px',
+                            fontWeight: 600,
+                            background: mode.bg,
+                            color: mode.color,
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '0.25rem',
+                          }}>
+                            {mode.emoji}
+                          </span>
+                        </td>
+                      )}
+                      <td className="strategy-cell">{strategyLabel(entry.strategy)}</td>
+                      <td><GradeBadge grade={entry.grade} /></td>
+                      <td className="score-cell">{entry.total_score.toFixed(1)}</td>
+                      {isContestMode && modeFilter === 'contest_final' && (
+                        <td style={{ fontWeight: 600, color: 'var(--accent, #6366f1)' }}>
+                          {(() => {
+                            const bestLiveRound = (entry.round_scores || []).find(r => (r.problem_code === 'Live') || (r.label && r.label.startsWith('Best Live')));
+                            return bestLiveRound && bestLiveRound.score != null ? bestLiveRound.score.toFixed(1) : '—';
+                          })()}
+                        </td>
+                      )}
+                      <td>{entry.latency_score.toFixed(1)}<span className="dim">/25</span></td>
+                      <td>{entry.throughput_score.toFixed(1)}<span className="dim">/25</span></td>
+                      <td>{entry.correctness_score.toFixed(1)}<span className="dim">/50</span></td>
+                      <td>{formatLatency(entry.p99_latency_ms)}</td>
+                      <td>{formatTPS(entry.tps)}</td>
+                    </tr>
                   );
                 })}
               </tbody>
@@ -460,7 +866,23 @@ export default function Leaderboard() {
         </>
       )}
 
+      <ContestantSubmissionsModal
+        contestant={selectedContestant}
+        onClose={() => setSelectedContestant(null)}
+        onViewSubmission={(sub) => {
+          setSelected(sub);
+        }}
+        onViewFinalProblem={(prob) => {
+          setSelectedFinalProblem(prob);
+        }}
+      />
       <SubmissionDetail submission={selected} onClose={() => setSelected(null)} />
+      {selectedFinalProblem && (
+        <FinalProblemDetailModal
+          problem={selectedFinalProblem}
+          onClose={() => setSelectedFinalProblem(null)}
+        />
+      )}
     </section>
   );
 }

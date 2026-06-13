@@ -6,18 +6,18 @@ import (
 
 // Scoring thresholds — tuned for competitive trading engine benchmarking.
 const (
-	// Latency scoring (0–50 points)
-	LatencyMaxScore   = 50.0
+	// Latency scoring (0–25 points)
+	LatencyMaxScore   = 25.0
 	LatencyPerfectP99 = 5.0   // ms — full score at or below
 	LatencyZeroP99    = 100.0 // ms — zero score at or above
 
-	// Throughput scoring (0–30 points)
-	ThroughputMaxScore   = 30.0
+	// Throughput scoring (0–25 points)
+	ThroughputMaxScore   = 25.0
 	ThroughputPerfectTPS = 5000.0 // full score at or above
 	ThroughputZeroTPS    = 100.0  // zero score at or below
 
-	// Correctness scoring (0–20 points)
-	CorrectnessMaxScore = 20.0
+	// Correctness scoring (0–50 points)
+	CorrectnessMaxScore = 50.0
 )
 
 // Score is the final graded result for a submission.
@@ -60,17 +60,21 @@ func ComputeScore(metrics PerformanceMetrics, validation validator.ValidationRes
 	}
 
 	// --- Correctness (0–20) ---
+	// Total errors = crosses + mismatches + unparseable responses.
 	if validation.OrdersProcessed == 0 {
 		s.CorrectnessScore = 0 // Zero orders processed = zero correctness points
-	} else if validation.CrossEvents == 0 {
-		s.CorrectnessScore = CorrectnessMaxScore
 	} else {
-		// Proportional deduction: lose points for every cross relative to total orders.
-		errorRate := float64(validation.CrossEvents) / float64(validation.OrdersProcessed)
-		if errorRate >= 1 {
-			s.CorrectnessScore = 0
+		totalErrors := validation.TotalErrors()
+		if totalErrors == 0 {
+			s.CorrectnessScore = CorrectnessMaxScore
 		} else {
-			s.CorrectnessScore = CorrectnessMaxScore * (1 - errorRate)
+			// Proportional deduction: lose points for every error relative to total orders.
+			errorRate := float64(totalErrors) / float64(validation.OrdersProcessed)
+			if errorRate >= 1 {
+				s.CorrectnessScore = 0
+			} else {
+				s.CorrectnessScore = CorrectnessMaxScore * (1 - errorRate)
+			}
 		}
 	}
 

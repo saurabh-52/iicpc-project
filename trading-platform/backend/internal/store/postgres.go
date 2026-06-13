@@ -2,9 +2,11 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"time"
 
@@ -53,6 +55,12 @@ func NewStore(ctx context.Context, databaseURL string) (*Store, error) {
 
 	return &Store{pool: pool}, nil
 }
+
+// Pool returns the underlying pgxpool.Pool connection pool.
+func (s *Store) Pool() *pgxpool.Pool {
+	return s.pool
+}
+
 
 // WithTx executes the given function within a database transaction.
 func (s *Store) WithTx(ctx context.Context, fn func(pgx.Tx) error) error {
@@ -163,8 +171,8 @@ INSERT INTO submission_results (
 	submission_id, system_name, strategy, language, submitted_at, total_score, latency_score,
 	throughput_score, correctness_score, grade, p99_latency_ms, tps,
 	cross_events, orders_processed, raw_metrics, raw_validation,
-	judging_mode, contest_id, final_round, seed_used, user_id, source_code
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,$16::jsonb,$17,$18,$19,$20,$21,$22)
+	judging_mode, contest_id, final_round, seed_used, user_id, source_code, problem_id, filename
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,$16::jsonb,$17,$18,$19,$20,$21,$22,$23,$24)
 ON CONFLICT (submission_id) DO UPDATE SET
 	system_name = EXCLUDED.system_name,
 	strategy = EXCLUDED.strategy,
@@ -184,7 +192,9 @@ ON CONFLICT (submission_id) DO UPDATE SET
 	final_round = EXCLUDED.final_round,
 	seed_used = EXCLUDED.seed_used,
 	user_id = EXCLUDED.user_id,
-	source_code = EXCLUDED.source_code
+	source_code = EXCLUDED.source_code,
+	problem_id = EXCLUDED.problem_id,
+	filename = EXCLUDED.filename
 `
 	var contestID interface{} = r.ContestID
 	if r.ContestID == "" {
@@ -200,7 +210,7 @@ ON CONFLICT (submission_id) DO UPDATE SET
 		r.Grade, r.P99LatencyMs, r.TPS,
 		r.CrossEvents, r.OrdersProcessed,
 		string(r.RawMetrics), string(r.RawValidation),
-		r.JudgingMode, contestID, r.FinalRound, r.SeedUsed, userID, r.SourceCode,
+		r.JudgingMode, contestID, r.FinalRound, r.SeedUsed, userID, r.SourceCode, r.ProblemID, r.Filename,
 	)
 	return err
 }
@@ -216,7 +226,7 @@ SELECT * FROM (
 		   sr.throughput_score, sr.correctness_score, sr.grade, sr.p99_latency_ms, sr.tps,
 		   sr.cross_events, sr.orders_processed, sr.raw_metrics, sr.raw_validation,
 		   sr.judging_mode, COALESCE(sr.contest_id, ''), sr.final_round, sr.seed_used,
-		   COALESCE(sr.user_id, ''), COALESCE(u.username, sr.system_name)
+		   COALESCE(sr.user_id, ''), COALESCE(u.username, sr.system_name), COALESCE(sr.problem_id, ''), sr.filename
 	FROM submission_results sr
 	LEFT JOIN users u ON sr.user_id = u.id
 	WHERE sr.judging_mode = 'practice'
@@ -238,7 +248,7 @@ SELECT * FROM (
 		   sr.throughput_score, sr.correctness_score, sr.grade, sr.p99_latency_ms, sr.tps,
 		   sr.cross_events, sr.orders_processed, sr.raw_metrics, sr.raw_validation,
 		   sr.judging_mode, COALESCE(sr.contest_id, ''), sr.final_round, sr.seed_used,
-		   COALESCE(sr.user_id, ''), COALESCE(u.username, sr.system_name)
+		   COALESCE(sr.user_id, ''), COALESCE(u.username, sr.system_name), COALESCE(sr.problem_id, ''), sr.filename
 	FROM submission_results sr
 	LEFT JOIN users u ON sr.user_id = u.id
 	WHERE sr.strategy = $1 AND sr.judging_mode = 'practice'
@@ -263,7 +273,7 @@ LIMIT $2
 			&r.CrossEvents, &r.OrdersProcessed,
 			&r.RawMetrics, &r.RawValidation,
 			&r.JudgingMode, &r.ContestID, &r.FinalRound, &r.SeedUsed,
-			&r.UserID, &r.Username,
+			&r.UserID, &r.Username, &r.ProblemID, &r.Filename,
 		); err != nil {
 			return nil, err
 		}
@@ -290,7 +300,7 @@ func (s *Store) scanLeaderboard(ctx context.Context, query string, limit int) ([
 			&r.CrossEvents, &r.OrdersProcessed,
 			&r.RawMetrics, &r.RawValidation,
 			&r.JudgingMode, &r.ContestID, &r.FinalRound, &r.SeedUsed,
-			&r.UserID, &r.Username,
+			&r.UserID, &r.Username, &r.ProblemID, &r.Filename,
 		); err != nil {
 			return nil, err
 		}
@@ -305,7 +315,7 @@ func (s *Store) GetSubmissionHistory(ctx context.Context, systemName string, lim
 SELECT submission_id, system_name, strategy, language, submitted_at, total_score, latency_score,
        throughput_score, correctness_score, grade, p99_latency_ms, tps,
        cross_events, orders_processed, raw_metrics, raw_validation,
-       judging_mode, COALESCE(contest_id, ''), final_round, seed_used
+       judging_mode, COALESCE(contest_id, ''), final_round, seed_used, COALESCE(problem_id, ''), filename
 FROM submission_results
 WHERE system_name = $1 AND judging_mode = 'practice'
 ORDER BY submitted_at DESC
@@ -326,7 +336,7 @@ LIMIT $2
 			&r.Grade, &r.P99LatencyMs, &r.TPS,
 			&r.CrossEvents, &r.OrdersProcessed,
 			&r.RawMetrics, &r.RawValidation,
-			&r.JudgingMode, &r.ContestID, &r.FinalRound, &r.SeedUsed,
+			&r.JudgingMode, &r.ContestID, &r.FinalRound, &r.SeedUsed, &r.ProblemID, &r.Filename,
 		); err != nil {
 			return nil, err
 		}
@@ -341,7 +351,7 @@ func (s *Store) GetSubmission(ctx context.Context, submissionID string) (Submiss
 SELECT submission_id, system_name, strategy, language, submitted_at, total_score, latency_score,
        throughput_score, correctness_score, grade, p99_latency_ms, tps,
        cross_events, orders_processed, raw_metrics, raw_validation,
-       judging_mode, COALESCE(contest_id, ''), final_round, seed_used
+       judging_mode, COALESCE(contest_id, ''), final_round, seed_used, COALESCE(problem_id, ''), filename
 FROM submission_results
 WHERE submission_id = $1
 `
@@ -352,7 +362,7 @@ WHERE submission_id = $1
 		&r.Grade, &r.P99LatencyMs, &r.TPS,
 		&r.CrossEvents, &r.OrdersProcessed,
 		&r.RawMetrics, &r.RawValidation,
-		&r.JudgingMode, &r.ContestID, &r.FinalRound, &r.SeedUsed,
+		&r.JudgingMode, &r.ContestID, &r.FinalRound, &r.SeedUsed, &r.ProblemID, &r.Filename,
 	)
 	return r, err
 }
@@ -408,6 +418,7 @@ func (s *Store) PublishContest(
 	finalStrategies []string,
 	problems []ProblemData,
 	createdBy string,
+	banner string,
 ) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -421,8 +432,8 @@ func (s *Store) PublishContest(
 
 	// Insert or update contest
 	const qContest = `
-INSERT INTO contests (id, name, description, visibility, code, start_time, duration_minutes, registration_deadline, strategy, final_strategies, created_by)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+INSERT INTO contests (id, name, description, visibility, code, start_time, duration_minutes, registration_deadline, strategy, final_strategies, created_by, banner)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 ON CONFLICT (id) DO UPDATE SET
 	name = EXCLUDED.name,
 	description = EXCLUDED.description,
@@ -433,9 +444,10 @@ ON CONFLICT (id) DO UPDATE SET
 	registration_deadline = EXCLUDED.registration_deadline,
 	strategy = EXCLUDED.strategy,
 	final_strategies = EXCLUDED.final_strategies,
-	created_by = EXCLUDED.created_by
+	created_by = EXCLUDED.created_by,
+	banner = EXCLUDED.banner
 `
-	_, err = tx.Exec(ctx, qContest, contestID, name, description, visibility, code, startTime, durationMinutes, registrationDeadline, strategy, finalStrategies, createdBy)
+	_, err = tx.Exec(ctx, qContest, contestID, name, description, visibility, code, startTime, durationMinutes, registrationDeadline, strategy, finalStrategies, createdBy, banner)
 	if err != nil {
 		return fmt.Errorf("publish_contest: failed to insert contest: %w", err)
 	}
@@ -494,13 +506,14 @@ type Contest struct {
 	FinalStrategies      []string   `json:"finalStrategies"`
 	CreatedBy            string     `json:"createdBy"`
 	Phase                string     `json:"phase"`
+	Banner               string     `json:"bannerPreview"`
 }
 
 // GetContests retrieves all contests from the database.
 // The code field is intentionally excluded from the list query to avoid leaking private contest codes.
 func (s *Store) GetContests(ctx context.Context) ([]Contest, error) {
 	const q = `
-SELECT c.id, c.name, c.description, c.visibility, c.start_time, c.duration_minutes, c.registration_deadline, c.created_at, c.strategy, c.final_strategies, c.created_by, c.phase,
+SELECT c.id, c.name, c.description, c.visibility, c.start_time, c.duration_minutes, c.registration_deadline, c.created_at, c.strategy, c.final_strategies, c.created_by, c.phase, c.banner,
        (SELECT COUNT(*)::int FROM contest_registrations r WHERE r.contest_id = c.id) AS participants
 FROM contests c
 ORDER BY c.start_time ASC
@@ -515,7 +528,7 @@ ORDER BY c.start_time ASC
 	for rows.Next() {
 		var c Contest
 		if err := rows.Scan(
-			&c.ID, &c.Name, &c.Description, &c.Visibility, &c.StartTime, &c.DurationMinutes, &c.RegistrationDeadline, &c.CreatedAt, &c.Strategy, &c.FinalStrategies, &c.CreatedBy, &c.Phase, &c.Participants,
+			&c.ID, &c.Name, &c.Description, &c.Visibility, &c.StartTime, &c.DurationMinutes, &c.RegistrationDeadline, &c.CreatedAt, &c.Strategy, &c.FinalStrategies, &c.CreatedBy, &c.Phase, &c.Banner, &c.Participants,
 		); err != nil {
 			return nil, err
 		}
@@ -623,31 +636,45 @@ func (s *Store) GetContestLeaderboard(ctx context.Context, contestID string, lim
 		return finals, nil, err
 	}
 
-	// Fall back to live submission results for this contest, fetching only the BEST submission per system
+	// Fall back to live submission results for this contest, fetching the BEST submission per team per problem
 	const q = `
-WITH LatestSubmissions AS (
-    SELECT DISTINCT ON (COALESCE(u.username, sr.system_name))
-           sr.submission_id, sr.system_name, sr.strategy, sr.language, sr.submitted_at, sr.total_score, sr.latency_score,
-           sr.throughput_score, sr.correctness_score, sr.grade, sr.p99_latency_ms, sr.tps,
-           sr.cross_events, sr.orders_processed, sr.raw_metrics, sr.raw_validation,
-           sr.judging_mode, COALESCE(sr.contest_id, '') AS c_id, sr.final_round, sr.seed_used,
-           sr.user_id, u.username
-    FROM submission_results sr
-    LEFT JOIN users u ON sr.user_id = u.id
-    WHERE sr.contest_id = $1 AND sr.judging_mode = 'contest_live'
-    ORDER BY COALESCE(u.username, sr.system_name), sr.total_score DESC, sr.submitted_at DESC
-)
-SELECT * FROM LatestSubmissions
-ORDER BY total_score DESC
-LIMIT $2
+SELECT DISTINCT ON (COALESCE(u.username, sr.system_name), sr.problem_id)
+       sr.submission_id, sr.system_name, sr.strategy, sr.language, sr.submitted_at, sr.total_score, sr.latency_score,
+       sr.throughput_score, sr.correctness_score, sr.grade, sr.p99_latency_ms, sr.tps,
+       sr.cross_events, sr.orders_processed, sr.raw_metrics, sr.raw_validation,
+       sr.judging_mode, COALESCE(sr.contest_id, '') AS c_id, sr.final_round, sr.seed_used,
+       sr.user_id, u.username, COALESCE(sr.problem_id, ''), sr.filename,
+       COALESCE(p.code, '') AS problem_code, COALESCE(p.title, '') AS problem_title
+FROM submission_results sr
+LEFT JOIN users u ON sr.user_id = u.id
+LEFT JOIN problems p ON sr.problem_id = p.id
+WHERE sr.contest_id = $1 AND sr.judging_mode = 'contest_live'
+ORDER BY COALESCE(u.username, sr.system_name), sr.problem_id, sr.total_score DESC, sr.submitted_at DESC
 `
-	rows, err := s.pool.Query(ctx, q, contestID, limit)
+	rows, err := s.pool.Query(ctx, q, contestID)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer rows.Close()
 
-	var results []SubmissionResult
+	type contestantGroup struct {
+		UserID           string
+		Username         string
+		SystemName       string
+		Submissions      []SubmissionResult
+		TotalScore       float64
+		LatencySum       float64
+		ThroughputSum    float64
+		CorrectnessSum   float64
+		P99Sum           float64
+		TPSSum           float64
+		CrossEventsSum   int
+		OrdersSum        int
+		LatestSubmitted  time.Time
+	}
+
+	groups := make(map[string]*contestantGroup)
+
 	for rows.Next() {
 		var r SubmissionResult
 		if err := rows.Scan(
@@ -657,13 +684,100 @@ LIMIT $2
 			&r.CrossEvents, &r.OrdersProcessed,
 			&r.RawMetrics, &r.RawValidation,
 			&r.JudgingMode, &r.ContestID, &r.FinalRound, &r.SeedUsed,
-			&r.UserID, &r.Username,
+			&r.UserID, &r.Username, &r.ProblemID, &r.Filename,
+			&r.ProblemCode, &r.ProblemTitle,
 		); err != nil {
 			return nil, nil, err
 		}
-		results = append(results, r)
+
+		name := r.Username
+		if name == "" {
+			name = r.SystemName
+		}
+		if name == "" {
+			continue
+		}
+
+		g, ok := groups[name]
+		if !ok {
+			g = &contestantGroup{
+				UserID:     r.UserID,
+				Username:   r.Username,
+				SystemName: r.SystemName,
+			}
+			groups[name] = g
+		}
+
+		g.Submissions = append(g.Submissions, r)
+		g.TotalScore += r.TotalScore
+		g.LatencySum += r.LatencyScore
+		g.ThroughputSum += r.ThroughputScore
+		g.CorrectnessSum += r.CorrectnessScore
+		g.P99Sum += r.P99LatencyMs
+		g.TPSSum += r.TPS
+		g.CrossEventsSum += r.CrossEvents
+		g.OrdersSum += r.OrdersProcessed
+		if r.SubmittedAt.After(g.LatestSubmitted) {
+			g.LatestSubmitted = r.SubmittedAt
+		}
 	}
-	return nil, results, rows.Err()
+
+	var results []SubmissionResult
+	for name, g := range groups {
+		if len(g.Submissions) == 0 {
+			continue
+		}
+		n := float64(len(g.Submissions))
+		avgScore := g.TotalScore / n
+		var grade string
+		if avgScore >= 95 {
+			grade = "S"
+		} else if avgScore >= 90 {
+			grade = "A"
+		} else if avgScore >= 80 {
+			grade = "B"
+		} else if avgScore >= 70 {
+			grade = "C"
+		} else {
+			grade = "F"
+		}
+
+		subJSON, _ := json.Marshal(g.Submissions)
+
+		res := SubmissionResult{
+			SubmissionID:     "contestant-" + name,
+			SystemName:       g.SystemName,
+			UserID:           g.UserID,
+			Username:         g.Username,
+			SubmittedAt:      g.LatestSubmitted,
+			TotalScore:       g.TotalScore,
+			LatencyScore:     g.LatencySum / n,
+			ThroughputScore:  g.ThroughputSum / n,
+			CorrectnessScore: g.CorrectnessSum / n,
+			P99LatencyMs:     g.P99Sum / n,
+			TPS:              g.TPSSum / n,
+			CrossEvents:      g.CrossEventsSum,
+			OrdersProcessed:  g.OrdersSum,
+			Grade:            grade,
+			RawMetrics:       json.RawMessage(subJSON),
+			JudgingMode:      "contest_live",
+			Strategy:         "Combined Live",
+		}
+		results = append(results, res)
+	}
+
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].TotalScore != results[j].TotalScore {
+			return results[i].TotalScore > results[j].TotalScore
+		}
+		return results[i].SubmittedAt.After(results[j].SubmittedAt)
+	})
+
+	if len(results) > limit {
+		results = results[:limit]
+	}
+
+	return nil, results, nil
 }
 
 // UpdateContestPhase transitions a contest to a new phase.
@@ -789,14 +903,14 @@ LIMIT $2
 // GetContest returns a single contest by ID.
 func (s *Store) GetContest(ctx context.Context, contestID string) (Contest, error) {
 	const q = `
-SELECT c.id, c.name, c.description, c.visibility, c.code, c.start_time, c.duration_minutes, c.registration_deadline, c.created_at, c.strategy, c.final_strategies, c.created_by, c.phase,
+SELECT c.id, c.name, c.description, c.visibility, c.code, c.start_time, c.duration_minutes, c.registration_deadline, c.created_at, c.strategy, c.final_strategies, c.created_by, c.phase, c.banner,
        (SELECT COUNT(*)::int FROM contest_registrations r WHERE r.contest_id = c.id) AS participants
 FROM contests c
 WHERE c.id = $1
 `
 	var c Contest
 	err := s.pool.QueryRow(ctx, q, contestID).Scan(
-		&c.ID, &c.Name, &c.Description, &c.Visibility, &c.Code, &c.StartTime, &c.DurationMinutes, &c.RegistrationDeadline, &c.CreatedAt, &c.Strategy, &c.FinalStrategies, &c.CreatedBy, &c.Phase, &c.Participants,
+		&c.ID, &c.Name, &c.Description, &c.Visibility, &c.Code, &c.StartTime, &c.DurationMinutes, &c.RegistrationDeadline, &c.CreatedAt, &c.Strategy, &c.FinalStrategies, &c.CreatedBy, &c.Phase, &c.Banner, &c.Participants,
 	)
 	return c, err
 }
@@ -906,19 +1020,41 @@ func (s *Store) GetUserByID(ctx context.Context, id string) (User, error) {
 	return u, err
 }
 
-// GetUserHistory returns all submissions for a specific user ID, most recent first.
-func (s *Store) GetUserHistory(ctx context.Context, userID string, limit int) ([]SubmissionResult, error) {
-	const q = `
+// GetUserHistory returns submissions for a specific user ID, with optional contest_id, problem_id, and judging_mode filtering, most recent first.
+func (s *Store) GetUserHistory(ctx context.Context, userID string, contestID, problemID, judgingMode string, limit int) ([]SubmissionResult, error) {
+	var q strings.Builder
+	q.WriteString(`
 SELECT submission_id, system_name, strategy, language, submitted_at, total_score, latency_score,
        throughput_score, correctness_score, grade, p99_latency_ms, tps,
        cross_events, orders_processed, raw_metrics, raw_validation,
-       judging_mode, COALESCE(contest_id, ''), final_round, seed_used
+       judging_mode, COALESCE(contest_id, ''), final_round, seed_used, COALESCE(problem_id, ''), filename
 FROM submission_results
-WHERE user_id = $1
-ORDER BY submitted_at DESC
-LIMIT $2
-`
-	rows, err := s.pool.Query(ctx, q, userID, limit)
+WHERE user_id = $1`)
+
+	args := []interface{}{userID}
+	paramCount := 1
+
+	if contestID != "" {
+		paramCount++
+		q.WriteString(fmt.Sprintf(" AND contest_id = $%d", paramCount))
+		args = append(args, contestID)
+	}
+	if problemID != "" {
+		paramCount++
+		q.WriteString(fmt.Sprintf(" AND problem_id = $%d", paramCount))
+		args = append(args, problemID)
+	}
+	if judgingMode != "" {
+		paramCount++
+		q.WriteString(fmt.Sprintf(" AND judging_mode = $%d", paramCount))
+		args = append(args, judgingMode)
+	}
+
+	paramCount++
+	q.WriteString(fmt.Sprintf(" ORDER BY submitted_at DESC LIMIT $%d", paramCount))
+	args = append(args, limit)
+
+	rows, err := s.pool.Query(ctx, q.String(), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -933,7 +1069,7 @@ LIMIT $2
 			&r.Grade, &r.P99LatencyMs, &r.TPS,
 			&r.CrossEvents, &r.OrdersProcessed,
 			&r.RawMetrics, &r.RawValidation,
-			&r.JudgingMode, &r.ContestID, &r.FinalRound, &r.SeedUsed,
+			&r.JudgingMode, &r.ContestID, &r.FinalRound, &r.SeedUsed, &r.ProblemID, &r.Filename,
 		); err != nil {
 			return nil, err
 		}
@@ -956,7 +1092,7 @@ func (s *Store) GetBestScore(ctx context.Context, userID string) (*SubmissionRes
 SELECT submission_id, system_name, strategy, language, submitted_at, total_score, latency_score,
        throughput_score, correctness_score, grade, p99_latency_ms, tps,
        cross_events, orders_processed, raw_metrics, raw_validation,
-       judging_mode, COALESCE(contest_id, ''), final_round, seed_used
+       judging_mode, COALESCE(contest_id, ''), final_round, seed_used, COALESCE(problem_id, ''), filename
 FROM submission_results
 WHERE user_id = $1 AND judging_mode = 'practice'
 ORDER BY total_score DESC
@@ -969,7 +1105,7 @@ LIMIT 1
 		&r.Grade, &r.P99LatencyMs, &r.TPS,
 		&r.CrossEvents, &r.OrdersProcessed,
 		&r.RawMetrics, &r.RawValidation,
-		&r.JudgingMode, &r.ContestID, &r.FinalRound, &r.SeedUsed,
+		&r.JudgingMode, &r.ContestID, &r.FinalRound, &r.SeedUsed, &r.ProblemID, &r.Filename,
 	)
 	if err != nil {
 		// pgx returns pgx.ErrNoRows if nothing matches, which is useful to distinguish
@@ -977,6 +1113,105 @@ LIMIT 1
 	}
 	return &r, nil
 }
+
+// GetLatestLiveSubmissionForTeam returns the latest contest_live submission for a given team in a contest.
+func (s *Store) GetLatestLiveSubmissionForTeam(ctx context.Context, contestID string, systemName string) (*SubmissionResult, error) {
+	const q = `
+SELECT submission_id, system_name, strategy, language, submitted_at, total_score, latency_score,
+       throughput_score, correctness_score, grade, p99_latency_ms, tps,
+       cross_events, orders_processed, raw_metrics, raw_validation,
+       judging_mode, COALESCE(contest_id, ''), final_round, seed_used,
+       COALESCE(user_id, ''), source_code, COALESCE(problem_id, ''), filename
+FROM submission_results
+WHERE contest_id = $1 AND system_name = $2 AND judging_mode = 'contest_live'
+ORDER BY submitted_at DESC
+LIMIT 1
+`
+	var r SubmissionResult
+	var userID string
+	err := s.pool.QueryRow(ctx, q, contestID, systemName).Scan(
+		&r.SubmissionID, &r.SystemName, &r.Strategy, &r.Language, &r.SubmittedAt,
+		&r.TotalScore, &r.LatencyScore, &r.ThroughputScore, &r.CorrectnessScore,
+		&r.Grade, &r.P99LatencyMs, &r.TPS,
+		&r.CrossEvents, &r.OrdersProcessed,
+		&r.RawMetrics, &r.RawValidation,
+		&r.JudgingMode, &r.ContestID, &r.FinalRound, &r.SeedUsed,
+		&userID, &r.SourceCode, &r.ProblemID, &r.Filename,
+	)
+	if err != nil {
+		return nil, err
+	}
+	r.UserID = userID
+	return &r, nil
+}
+
+// GetBestLiveSubmissionForTeamAndProblem returns the team's best scoring contest_live submission for a specific problem.
+func (s *Store) GetBestLiveSubmissionForTeamAndProblem(ctx context.Context, contestID string, systemName string, problemID string) (*SubmissionResult, error) {
+	const q = `
+SELECT sr.submission_id, sr.system_name, sr.strategy, sr.language, sr.submitted_at, sr.total_score, sr.latency_score,
+       sr.throughput_score, sr.correctness_score, sr.grade, sr.p99_latency_ms, sr.tps,
+       sr.cross_events, sr.orders_processed, sr.raw_metrics, sr.raw_validation,
+       sr.judging_mode, COALESCE(sr.contest_id, '') AS c_id, sr.final_round, sr.seed_used,
+       COALESCE(sr.user_id, '') AS user_id, COALESCE(u.username, '') AS username, sr.source_code, COALESCE(sr.problem_id, ''), sr.filename
+FROM submission_results sr
+LEFT JOIN users u ON sr.user_id = u.id
+WHERE sr.contest_id = $1 AND (COALESCE(u.username, sr.system_name) = $2 OR sr.system_name = $2) AND sr.problem_id = $3 AND sr.judging_mode = 'contest_live'
+ORDER BY sr.total_score DESC, sr.submitted_at DESC
+LIMIT 1
+`
+	var r SubmissionResult
+	err := s.pool.QueryRow(ctx, q, contestID, systemName, problemID).Scan(
+		&r.SubmissionID, &r.SystemName, &r.Strategy, &r.Language, &r.SubmittedAt,
+		&r.TotalScore, &r.LatencyScore, &r.ThroughputScore, &r.CorrectnessScore,
+		&r.Grade, &r.P99LatencyMs, &r.TPS,
+		&r.CrossEvents, &r.OrdersProcessed,
+		&r.RawMetrics, &r.RawValidation,
+		&r.JudgingMode, &r.ContestID, &r.FinalRound, &r.SeedUsed,
+		&r.UserID, &r.Username, &r.SourceCode, &r.ProblemID, &r.Filename,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &r, nil
+}
+
+// GetLatestLiveSubmissionForTeamAndProblem returns the team's latest contest_live submission for a specific problem.
+func (s *Store) GetLatestLiveSubmissionForTeamAndProblem(ctx context.Context, contestID string, systemName string, problemID string) (*SubmissionResult, error) {
+	const q = `
+SELECT sr.submission_id, sr.system_name, sr.strategy, sr.language, sr.submitted_at, sr.total_score, sr.latency_score,
+       sr.throughput_score, sr.correctness_score, sr.grade, sr.p99_latency_ms, sr.tps,
+       sr.cross_events, sr.orders_processed, sr.raw_metrics, sr.raw_validation,
+       sr.judging_mode, COALESCE(sr.contest_id, '') AS c_id, sr.final_round, sr.seed_used,
+       COALESCE(sr.user_id, '') AS user_id, COALESCE(u.username, '') AS username, sr.source_code, COALESCE(sr.problem_id, ''), sr.filename
+FROM submission_results sr
+LEFT JOIN users u ON sr.user_id = u.id
+WHERE sr.contest_id = $1 AND (COALESCE(u.username, sr.system_name) = $2 OR sr.system_name = $2) AND sr.problem_id = $3 AND sr.judging_mode = 'contest_live'
+ORDER BY sr.submitted_at DESC
+LIMIT 1
+`
+	var r SubmissionResult
+	err := s.pool.QueryRow(ctx, q, contestID, systemName, problemID).Scan(
+		&r.SubmissionID, &r.SystemName, &r.Strategy, &r.Language, &r.SubmittedAt,
+		&r.TotalScore, &r.LatencyScore, &r.ThroughputScore, &r.CorrectnessScore,
+		&r.Grade, &r.P99LatencyMs, &r.TPS,
+		&r.CrossEvents, &r.OrdersProcessed,
+		&r.RawMetrics, &r.RawValidation,
+		&r.JudgingMode, &r.ContestID, &r.FinalRound, &r.SeedUsed,
+		&r.UserID, &r.Username, &r.SourceCode, &r.ProblemID, &r.Filename,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &r, nil
+}
+
+
 
 // GetPaginatedUserHistory returns a paginated list of practice submissions for a specific user ID.
 func (s *Store) GetPaginatedUserHistory(ctx context.Context, userID string, page, pageSize int) ([]SubmissionResult, int, error) {
@@ -999,7 +1234,7 @@ func (s *Store) GetPaginatedUserHistory(ctx context.Context, userID string, page
 SELECT submission_id, system_name, strategy, language, submitted_at, total_score, latency_score,
        throughput_score, correctness_score, grade, p99_latency_ms, tps,
        cross_events, orders_processed, raw_metrics, raw_validation,
-       judging_mode, COALESCE(contest_id, ''), final_round, seed_used
+       judging_mode, COALESCE(contest_id, ''), final_round, seed_used, COALESCE(problem_id, ''), filename
 FROM submission_results
 WHERE user_id = $1 AND judging_mode = 'practice'
 ORDER BY submitted_at DESC
@@ -1020,7 +1255,7 @@ LIMIT $2 OFFSET $3
 			&r.Grade, &r.P99LatencyMs, &r.TPS,
 			&r.CrossEvents, &r.OrdersProcessed,
 			&r.RawMetrics, &r.RawValidation,
-			&r.JudgingMode, &r.ContestID, &r.FinalRound, &r.SeedUsed,
+			&r.JudgingMode, &r.ContestID, &r.FinalRound, &r.SeedUsed, &r.ProblemID, &r.Filename,
 		); err != nil {
 			return nil, 0, err
 		}

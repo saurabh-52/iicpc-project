@@ -103,7 +103,7 @@ func TestFullPhase3Pipeline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("botfleet.Run: %v", err)
 	}
-	t.Logf("Bot fleet summary: Successes=%d, Failures=%d, TPS=%.0f", summary.Successes, summary.Failures, summary.TPS)
+	t.Logf("Bot fleet summary: Successes=%d, Failures=%d, TPS=%.0f", summary.Successes, summary.Failures, summary.RequestsPerSecond)
 
 	// Let async publishes flush
 	time.Sleep(500 * time.Millisecond)
@@ -155,7 +155,7 @@ func TestFullPhase3Pipeline(t *testing.T) {
 		sc.TotalScore, sc.LatencyScore, sc.ThroughputScore, sc.CorrectnessScore, sc.Grade)
 
 	// 9. Persist to Postgres
-	sr := store.NewSubmissionResult(submissionID, "test-engine", "bbo_heavy", "go", sc, perfMetrics, valResult)
+	sr := store.NewSubmissionResult(submissionID, "test-engine", "bbo_heavy", "go", "", "", sc, perfMetrics, valResult)
 	if err := db.CreateSubmissionResult(ctx, sr); err != nil {
 		t.Fatalf("CreateSubmissionResult: %v", err)
 	}

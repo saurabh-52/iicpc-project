@@ -25,7 +25,12 @@ class OrderBookHandler(http.server.BaseHTTPRequestHandler):
                 pass
 
         response = json.dumps(
-            {"status": "ok", "action": order.get("action", "unknown")}
+            {
+                "status": "ok",
+                "action": order.get("action", "unknown"),
+                "best_bid": 0.0,
+                "best_ask": 0.0,
+            }
         ).encode()
 
         self.send_response(200)
@@ -35,7 +40,7 @@ class OrderBookHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(response)
 
     def do_GET(self):
-        response = json.dumps({"status": "ok"}).encode()
+        response = json.dumps({"status": "ok", "best_bid": 0.0, "best_ask": 0.0}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(response)))

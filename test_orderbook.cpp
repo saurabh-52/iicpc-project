@@ -112,7 +112,7 @@ int main()
         }
 
         // 3. Now that the request is fully consumed, send the response
-        std::string body = "{\"status\":\"ok\"}";
+        std::string body = "{\"status\":\"ok\",\"best_bid\":0.0,\"best_ask\":0.0}";
         std::ostringstream resp;
         resp << "HTTP/1.1 200 OK\r\n";
         resp << "Content-Type: application/json\r\n";

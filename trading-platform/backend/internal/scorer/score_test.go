@@ -55,7 +55,7 @@ func TestFailingSubmission(t *testing.T) {
 		SubmissionID:    "failing",
 		Valid:           false,
 		OrdersProcessed: 100,
-		CrossEvents:    5,
+		CrossEvents:    80,
 	}
 
 	s := scorer.ComputeScore(metrics, val)

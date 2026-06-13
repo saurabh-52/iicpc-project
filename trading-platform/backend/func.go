@@ -1,4 +1,8 @@
+//go:build ignore
 
+package main
+
+import (
 	"encoding/json"
 	"fmt"
 	"log"
@@ -25,9 +29,14 @@ func runFinalization(ctx context.Context, contestID string, contest store.Contes
 	totalTeams := len(teams)
 
 	problems, _ := db.GetContestProblems(ctx, contestID)
-	hiddenStrategies := contest.FinalStrategies
-	if len(problems) > 0 && len(problems[0].HiddenStrategies) > 0 {
-		hiddenStrategies = problems[0].HiddenStrategies
+	var hiddenStrategies []string
+	if len(problems) > 0 {
+		for _, p := range problems {
+			hiddenStrategies = append(hiddenStrategies, p.HiddenStrategies...)
+		}
+	}
+	if len(hiddenStrategies) == 0 {
+		hiddenStrategies = contest.FinalStrategies
 	}
 
 	bestLiveScores, err := db.GetBestLiveScoresForContest(ctx, contestID)

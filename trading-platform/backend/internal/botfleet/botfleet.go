@@ -278,6 +278,11 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 	if cfg.Target == "" {
 		return Summary{}, fmt.Errorf("target is required")
 	}
+
+	// Wait for the target to be reachable (handles service/tunnel setup latency)
+	if err := waitForTargetReachable(ctx, cfg.Target, 10*time.Second); err != nil {
+		return Summary{}, err
+	}
 	if cfg.Bots <= 0 {
 		cfg.Bots = 32
 	}
@@ -387,15 +392,10 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 			}
 		}
 	} else {
-		for cfg.Requests > 0 && atomic.LoadInt64(&sent) < int64(cfg.Requests) {
-			select {
-			case <-workersDone:
-				goto done
-			default:
-				time.Sleep(10 * time.Millisecond)
-			}
+		select {
+		case <-workersDone:
+		case <-ctx.Done():
 		}
-	done:
 		cancel()
 	}
 
@@ -419,14 +419,18 @@ func runHTTPWorker(ctx context.Context, cfg Config, botID int, seq *int, rng *ra
 		Transport: transport,
 	}
 	for {
-		if !claimWork(ctx, cfg, sent, warmupEnd) {
+		now := time.Now()
+		if !claimWork(ctx, cfg, sent, warmupEnd, now) {
 			return
 		}
 		*seq++
 		order := generateOrder(cfg.Strategy, botID, *seq, rng)
 		payload, _ := json.Marshal(order)
-		req, err := http.NewRequestWithContext(ctx, cfg.Method, cfg.Target, bytes.NewReader(payload))
+		started := time.Now()
+		reqCtx, reqCancel := context.WithTimeout(ctx, cfg.Timeout)
+		req, err := http.NewRequestWithContext(reqCtx, cfg.Method, cfg.Target, bytes.NewReader(payload))
 		if err != nil {
+			reqCancel()
 			rec.addError(0, "request_build")
 			continue
 		}
@@ -434,11 +438,16 @@ func runHTTPWorker(ctx context.Context, cfg Config, botID int, seq *int, rng *ra
 		req.Header.Set("X-Bot-Id", fmt.Sprintf("%d", botID))
 		req.Header.Set("X-Strategy", string(cfg.Strategy))
 
-		started := time.Now()
 		resp, err := httpClient.Do(req)
+		reqCancel()
 		if err != nil {
-			errKind := classifyError(err)
-			rec.addError(time.Since(started), errKind)
+			if ctx.Err() != nil {
+				return
+			}
+			if now.After(warmupEnd) {
+				errKind := classifyError(err)
+				rec.addError(time.Since(started), errKind)
+			}
 			continue
 		}
 		latency := time.Since(started)
@@ -450,7 +459,7 @@ func runHTTPWorker(ctx context.Context, cfg Config, botID int, seq *int, rng *ra
 		_ = resp.Body.Close()
 		engineOut := string(bodyBuf[:n])
 
-		if started.After(warmupEnd) {
+		if now.After(warmupEnd) {
 			if resp.StatusCode >= 400 {
 				rec.addError(latency, fmt.Sprintf("http_%d", resp.StatusCode))
 			} else {
@@ -479,51 +488,109 @@ func runHTTPWorker(ctx context.Context, cfg Config, botID int, seq *int, rng *ra
 }
 
 func runTCPWorker(ctx context.Context, cfg Config, botID int, seq *int, rng *rand.Rand, rec *recorder, sent *int64, warmupEnd time.Time) {
-	dialer := net.Dialer{Timeout: cfg.Timeout}
-	conn, err := dialer.DialContext(ctx, "tcp", cfg.Target)
-	if err != nil {
-		rec.addError(0, "connection_refused")
-		return
-	}
-	defer conn.Close()
+	var conn net.Conn
+	var reader *bufio.Reader
+	var writer *bufio.Writer
 
-	reader := bufio.NewReader(conn)
-	writer := bufio.NewWriter(conn)
+	defer func() {
+		if conn != nil {
+			conn.Close()
+		}
+	}()
+
 	for {
-		if !claimWork(ctx, cfg, sent, warmupEnd) {
+		now := time.Now()
+		if !claimWork(ctx, cfg, sent, warmupEnd, now) {
 			return
 		}
+
+		if conn == nil {
+			dialer := net.Dialer{Timeout: cfg.Timeout}
+			var err error
+			conn, err = dialer.DialContext(ctx, "tcp", cfg.Target)
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				if time.Now().After(warmupEnd) {
+					rec.addError(0, "connection_refused")
+				}
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			reader = bufio.NewReader(conn)
+			writer = bufio.NewWriter(conn)
+		}
+
 		*seq++
 		order := generateOrder(cfg.Strategy, botID, *seq, rng)
 		payload, _ := json.Marshal(order)
 		started := time.Now()
 
 		if err := conn.SetWriteDeadline(time.Now().Add(cfg.Timeout)); err != nil {
-			rec.addError(time.Since(started), "write_deadline")
+			if ctx.Err() != nil {
+				return
+			}
+			if now.After(warmupEnd) {
+				rec.addError(time.Since(started), "write_deadline")
+			}
+			conn.Close()
+			conn = nil
 			continue
 		}
 		if _, err := writer.Write(append(payload, '\n')); err != nil {
-			rec.addError(time.Since(started), "write")
+			if ctx.Err() != nil {
+				return
+			}
+			if now.After(warmupEnd) {
+				rec.addError(time.Since(started), "write")
+			}
+			conn.Close()
+			conn = nil
 			continue
 		}
 		if err := writer.Flush(); err != nil {
-			rec.addError(time.Since(started), "flush")
+			if ctx.Err() != nil {
+				return
+			}
+			if now.After(warmupEnd) {
+				rec.addError(time.Since(started), "flush")
+			}
+			conn.Close()
+			conn = nil
 			continue
 		}
 
+		var engineOut string
 		if cfg.ExpectReply {
 			if err := conn.SetReadDeadline(time.Now().Add(cfg.Timeout)); err != nil {
-				rec.addError(time.Since(started), "read_deadline")
+				if ctx.Err() != nil {
+					return
+				}
+				if now.After(warmupEnd) {
+					rec.addError(time.Since(started), "read_deadline")
+				}
+				conn.Close()
+				conn = nil
 				continue
 			}
-			if _, err := reader.ReadBytes('\n'); err != nil {
-				errKind := classifyError(err)
-				rec.addError(time.Since(started), errKind)
+			respLine, err := reader.ReadBytes('\n')
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				if now.After(warmupEnd) {
+					errKind := classifyError(err)
+					rec.addError(time.Since(started), errKind)
+				}
+				conn.Close()
+				conn = nil
 				continue
 			}
+			engineOut = string(respLine)
 		}
 
-		if started.After(warmupEnd) {
+		if now.After(warmupEnd) {
 			rec.add(time.Since(started), true)
 
 			action := order.Action
@@ -541,6 +608,7 @@ func runTCPWorker(ctx context.Context, cfg Config, botID int, seq *int, rng *ran
 				StatusCode:   200,
 				LatencyMs:    float64(time.Since(started).Nanoseconds()) / 1e6,
 				Timestamp:    time.Now().UTC(),
+				EngineOutput: engineOut,
 			})
 		}
 	}
@@ -550,51 +618,109 @@ func runTCPWorker(ctx context.Context, cfg Config, botID int, seq *int, rng *ran
 // pipe-delimited key=value pairs terminated by newline.
 // e.g. "35=D|49=BOT0|54=1|55=SYM|44=100.50|38=25|10=000|\n"
 func runFIXWorker(ctx context.Context, cfg Config, botID int, seq *int, rng *rand.Rand, rec *recorder, sent *int64, warmupEnd time.Time) {
-	dialer := net.Dialer{Timeout: cfg.Timeout}
-	conn, err := dialer.DialContext(ctx, "tcp", cfg.Target)
-	if err != nil {
-		rec.addError(0, "connection_refused")
-		return
-	}
-	defer conn.Close()
+	var conn net.Conn
+	var reader *bufio.Reader
+	var writer *bufio.Writer
 
-	reader := bufio.NewReader(conn)
-	writer := bufio.NewWriter(conn)
+	defer func() {
+		if conn != nil {
+			conn.Close()
+		}
+	}()
+
 	for {
-		if !claimWork(ctx, cfg, sent, warmupEnd) {
+		now := time.Now()
+		if !claimWork(ctx, cfg, sent, warmupEnd, now) {
 			return
 		}
+
+		if conn == nil {
+			dialer := net.Dialer{Timeout: cfg.Timeout}
+			var err error
+			conn, err = dialer.DialContext(ctx, "tcp", cfg.Target)
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				if time.Now().After(warmupEnd) {
+					rec.addError(0, "connection_refused")
+				}
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			reader = bufio.NewReader(conn)
+			writer = bufio.NewWriter(conn)
+		}
+
 		*seq++
 		order := generateOrder(cfg.Strategy, botID, *seq, rng)
 		fixMsg := orderToFIX(order)
 		started := time.Now()
 
 		if err := conn.SetWriteDeadline(time.Now().Add(cfg.Timeout)); err != nil {
-			rec.addError(time.Since(started), "write_deadline")
+			if ctx.Err() != nil {
+				return
+			}
+			if now.After(warmupEnd) {
+				rec.addError(time.Since(started), "write_deadline")
+			}
+			conn.Close()
+			conn = nil
 			continue
 		}
 		if _, err := writer.WriteString(fixMsg + "\n"); err != nil {
-			rec.addError(time.Since(started), "write")
+			if ctx.Err() != nil {
+				return
+			}
+			if now.After(warmupEnd) {
+				rec.addError(time.Since(started), "write")
+			}
+			conn.Close()
+			conn = nil
 			continue
 		}
 		if err := writer.Flush(); err != nil {
-			rec.addError(time.Since(started), "flush")
+			if ctx.Err() != nil {
+				return
+			}
+			if now.After(warmupEnd) {
+				rec.addError(time.Since(started), "flush")
+			}
+			conn.Close()
+			conn = nil
 			continue
 		}
 
+		var engineOut string
 		if cfg.ExpectReply {
 			if err := conn.SetReadDeadline(time.Now().Add(cfg.Timeout)); err != nil {
-				rec.addError(time.Since(started), "read_deadline")
+				if ctx.Err() != nil {
+					return
+				}
+				if now.After(warmupEnd) {
+					rec.addError(time.Since(started), "read_deadline")
+				}
+				conn.Close()
+				conn = nil
 				continue
 			}
-			if _, err := reader.ReadBytes('\n'); err != nil {
-				errKind := classifyError(err)
-				rec.addError(time.Since(started), errKind)
+			respLine, err := reader.ReadBytes('\n')
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				if now.After(warmupEnd) {
+					errKind := classifyError(err)
+					rec.addError(time.Since(started), errKind)
+				}
+				conn.Close()
+				conn = nil
 				continue
 			}
+			engineOut = string(respLine)
 		}
 
-		if started.After(warmupEnd) {
+		if now.After(warmupEnd) {
 			rec.add(time.Since(started), true)
 
 			action := order.Action
@@ -612,6 +738,7 @@ func runFIXWorker(ctx context.Context, cfg Config, botID int, seq *int, rng *ran
 				StatusCode:   200,
 				LatencyMs:    float64(time.Since(started).Nanoseconds()) / 1e6,
 				Timestamp:    time.Now().UTC(),
+				EngineOutput: engineOut,
 			})
 		}
 	}
@@ -633,11 +760,11 @@ func orderToFIX(o Order) string {
 		msgType, o.BotID, o.Sequence, side, o.Price, o.Quantity)
 }
 
-func claimWork(ctx context.Context, cfg Config, sent *int64, warmupEnd time.Time) bool {
+func claimWork(ctx context.Context, cfg Config, sent *int64, warmupEnd time.Time, now time.Time) bool {
 	if ctx.Err() != nil {
 		return false
 	}
-	if time.Now().Before(warmupEnd) {
+	if now.Before(warmupEnd) {
 		return true
 	}
 	if cfg.Requests <= 0 {
@@ -816,7 +943,7 @@ func classifyError(err error) string {
 		return "connection_refused"
 	case strings.Contains(s, "i/o timeout") || strings.Contains(s, "deadline exceeded"):
 		return "timeout"
-	case strings.Contains(s, "connection reset"):
+	case strings.Contains(s, "connection reset") || strings.Contains(s, "forcibly closed"):
 		return "connection_reset"
 	case strings.Contains(s, "EOF"):
 		return "eof"
@@ -868,5 +995,36 @@ func percentileDuration(values []time.Duration, percentile float64) time.Duratio
 func ioCopyAndClose(body io.ReadCloser) (int64, error) {
 	defer body.Close()
 	return io.Copy(io.Discard, body)
+}
+
+func waitForTargetReachable(ctx context.Context, target string, timeout time.Duration) error {
+	addr := target
+	if strings.HasPrefix(addr, "http://") {
+		addr = addr[7:]
+	} else if strings.HasPrefix(addr, "https://") {
+		addr = addr[8:]
+	}
+	if idx := strings.Index(addr, "/"); idx != -1 {
+		addr = addr[:idx]
+	}
+
+	deadline := time.Now().Add(timeout)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			return nil
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return fmt.Errorf("timeout waiting for target %s to become reachable", target)
 }
 

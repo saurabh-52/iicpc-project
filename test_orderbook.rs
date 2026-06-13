@@ -50,7 +50,7 @@ fn handle_client(mut stream: TcpStream) {
     }
 
     // Send HTTP response
-    let body = "{\"status\":\"ok\"}";
+    let body = "{\"status\":\"ok\",\"best_bid\":0.0,\"best_ask\":0.0}";
     let response = format!(
         "HTTP/1.1 200 OK\r\n\
          Content-Type: application/json\r\n\

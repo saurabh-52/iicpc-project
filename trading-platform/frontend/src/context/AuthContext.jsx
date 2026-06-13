@@ -97,6 +97,7 @@ export function AuthProvider({ children }) {
     setUser(null);
     setToken(null);
     clearAuth();
+    window.location.href = '/login';
   }, []);
 
   const authHeaders = useCallback(() => {

@@ -28,11 +28,15 @@ type SubmissionResult struct {
 	RawValidation    json.RawMessage `json:"raw_validation"`
 	JudgingMode      string          `json:"judging_mode"`
 	ContestID        string          `json:"contest_id,omitempty"`
+	ProblemID        string          `json:"problem_id,omitempty"`
+	ProblemCode      string          `json:"problem_code,omitempty"`
+	ProblemTitle     string          `json:"problem_title,omitempty"`
 	FinalRound       *int            `json:"final_round,omitempty"`
 	SeedUsed         int64           `json:"seed_used"`
 	UserID           string          `json:"user_id"`
 	Username         string          `json:"username"`
 	SourceCode       string          `json:"source_code,omitempty"`
+	Filename         string          `json:"filename"`
 }
 
 // ContestFinalScore represents a post-contest averaged score for a team.
@@ -85,7 +89,10 @@ CREATE TABLE IF NOT EXISTS submission_results (
 	cross_events      INT NOT NULL DEFAULT 0,
 	orders_processed  INT NOT NULL DEFAULT 0,
 	raw_metrics       JSONB,
-	raw_validation    JSONB
+	raw_validation    JSONB,
+	source_code       TEXT DEFAULT '',
+	problem_id        TEXT NOT NULL DEFAULT '',
+	filename          TEXT NOT NULL DEFAULT ''
 );
 
 -- Add new columns for existing tables (safe to re-run)
@@ -113,6 +120,7 @@ CREATE TABLE IF NOT EXISTS contests (
 -- Ensure strategy and final_strategies are added to contests
 ALTER TABLE contests ADD COLUMN IF NOT EXISTS strategy TEXT NOT NULL DEFAULT 'bbo_heavy';
 ALTER TABLE contests ADD COLUMN IF NOT EXISTS final_strategies TEXT[] NOT NULL DEFAULT '{"bbo_heavy", "flash_crash", "high_cancel", "iceberg", "momentum_burst"}';
+ALTER TABLE contests ADD COLUMN IF NOT EXISTS banner TEXT NOT NULL DEFAULT '';
 
 
 CREATE TABLE IF NOT EXISTS problems (
@@ -188,6 +196,9 @@ ON contest_final_scores (contest_id, avg_score DESC);
 
 -- User linkage for submissions and registrations
 ALTER TABLE submission_results ADD COLUMN IF NOT EXISTS user_id TEXT;
+ALTER TABLE submission_results ADD COLUMN IF NOT EXISTS source_code TEXT DEFAULT '';
+ALTER TABLE submission_results ADD COLUMN IF NOT EXISTS problem_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE submission_results ADD COLUMN IF NOT EXISTS filename TEXT NOT NULL DEFAULT '';
 ALTER TABLE contest_registrations ADD COLUMN IF NOT EXISTS user_id TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_submission_results_user_id

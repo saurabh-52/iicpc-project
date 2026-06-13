@@ -19,6 +19,15 @@ function GradeBadge({ grade }) {
         background: style.bg,
         color: style.color,
         boxShadow: `0 4px 16px ${style.glow}`,
+        padding: '0.2rem 0.6rem',
+        borderRadius: '0.5rem',
+        fontWeight: '800',
+        fontSize: '0.8rem',
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        minWidth: '1.6rem',
+        height: '1.6rem',
       }}
     >
       {grade}
@@ -79,9 +88,9 @@ function SubmissionDetail({ submission, onClose }) {
           </div>
 
           <div className="detail-breakdown">
-            <ScoreBar label="Latency" value={submission.latency_score} max={50} color="#3b82f6" />
-            <ScoreBar label="Throughput" value={submission.throughput_score} max={30} color="#10b981" />
-            <ScoreBar label="Correctness" value={submission.correctness_score} max={20} color="#f59e0b" />
+            <ScoreBar label="Latency" value={submission.latency_score} max={25} color="#3b82f6" />
+            <ScoreBar label="Throughput" value={submission.throughput_score} max={25} color="#10b981" />
+            <ScoreBar label="Correctness" value={submission.correctness_score} max={50} color="#f59e0b" />
           </div>
         </div>
 
@@ -174,116 +183,152 @@ export default function ProfilePage() {
   const totalPages = Math.ceil(total / pageSize) || 1;
 
   return (
-    <div className="dashboard-container">
-      <div className="dashboard-header panel" style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
-        <div className="nav-user-avatar" style={{ width: '64px', height: '64px', fontSize: '2rem' }}>
-          {profile.user.username.charAt(0).toUpperCase()}
+    <div className="dashboard-grid">
+      {/* Left Column: Submission History */}
+      <section className="panel" style={{ borderRadius: '1.5rem', padding: '1.75rem', gridColumn: 'span 1' }}>
+        <div style={{ marginBottom: '1.5rem' }}>
+          <span className="section-tag">Performance History</span>
+          <h3 style={{ fontSize: '1.25rem', fontWeight: '700', color: 'var(--text-h)', margin: '0.25rem 0 0 0' }}>Submission Archive</h3>
         </div>
-        <div>
-          <span className="section-tag">User Profile</span>
-          <h2>{profile.user.username}</h2>
-        </div>
-      </div>
 
-      <div className="dashboard-grid">
-        <div className="dashboard-main">
-          {bestScore ? (
-            <article className="score-card panel highlight-panel">
-              <div className="score-header">
-                <h3>Personal Best Score</h3>
-                <span className="timestamp">{new Date(bestScore.submitted_at).toLocaleString()}</span>
-              </div>
-              <div className="score-hero">
-                <GradeBadge grade={bestScore.grade} />
-                <div className="score-big">
-                  {bestScore.total_score.toFixed(1)} <span className="score-max">/ 100</span>
-                </div>
-              </div>
-              <div className="metrics-grid">
-                <div className="metric">
-                  <span className="metric-label">Strategy</span>
-                  <span className="metric-val">{bestScore.strategy}</span>
-                </div>
-                <div className="metric">
-                  <span className="metric-label">P99 Latency</span>
-                  <span className="metric-val">{formatLatency(bestScore.p99_latency_ms)}</span>
-                </div>
-                <div className="metric">
-                  <span className="metric-label">Throughput</span>
-                  <span className="metric-val">{formatTPS(bestScore.tps)} TPS</span>
-                </div>
-                <div className="metric">
-                  <span className="metric-label">Correctness</span>
-                  <span className="metric-val">{(bestScore.correctness_score / 20 * 100).toFixed(0)}%</span>
-                </div>
-              </div>
-            </article>
-          ) : (
-             <article className="score-card panel">
-              <div className="score-header">
-                <h3>Personal Best Score</h3>
-              </div>
-              <div className="score-hero" style={{ opacity: 0.5 }}>
-                <p>No practice runs recorded yet.</p>
-              </div>
-            </article>
-          )}
-
-          <div className="leaderboard-table-wrap panel" style={{ marginTop: '1.5rem' }}>
-            <h3 style={{ marginBottom: '1rem' }}>Submission History</h3>
-            {history.length === 0 ? (
-              <p style={{ opacity: 0.6 }}>No practice history found.</p>
-            ) : (
-              <>
-                <table className="leaderboard-table">
-                  <thead>
-                    <tr>
-                      <th>Time</th>
-                      <th>Strategy</th>
-                      <th>Grade</th>
-                      <th>Score</th>
-                      <th>P99</th>
-                      <th>TPS</th>
+        {history.length === 0 ? (
+          <div style={{ textAlign: 'center', padding: '3rem 1rem', background: 'rgba(15, 23, 42, 0.02)', borderRadius: '1rem', border: '1px dashed rgba(148, 163, 184, 0.25)' }}>
+            <p style={{ color: '#64748b', margin: 0, fontSize: '0.95rem' }}>No practice history found for this user.</p>
+          </div>
+        ) : (
+          <>
+            <div className="leaderboard-table-wrap" style={{ border: '1px solid rgba(148, 163, 184, 0.15)', background: '#fff', borderRadius: '12px', overflow: 'hidden' }}>
+              <table className="leaderboard-table">
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Strategy</th>
+                    <th>Grade</th>
+                    <th>Score</th>
+                    <th>P99</th>
+                    <th>TPS</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {history.map(entry => (
+                    <tr 
+                      key={entry.submission_id} 
+                      className="lb-row" 
+                      onClick={() => setSelectedSubmission(entry)}
+                      style={{ cursor: 'pointer' }}
+                      title="Click to view details"
+                    >
+                      <td>{new Date(entry.submitted_at).toLocaleString()}</td>
+                      <td>{entry.strategy}</td>
+                      <td><GradeBadge grade={entry.grade} /></td>
+                      <td className="score-cell">{entry.total_score?.toFixed(1)}</td>
+                      <td>{formatLatency(entry.p99_latency_ms)}</td>
+                      <td>{formatTPS(entry.tps)}</td>
                     </tr>
-                  </thead>
-                  <tbody>
-                    {history.map(entry => (
-                      <tr 
-                        key={entry.submission_id} 
-                        className="lb-row" 
-                        onClick={() => setSelectedSubmission(entry)}
-                      >
-                        <td>{new Date(entry.submitted_at).toLocaleString()}</td>
-                        <td>{entry.strategy}</td>
-                        <td><GradeBadge grade={entry.grade} /></td>
-                        <td className="score-cell">{entry.total_score?.toFixed(1)}</td>
-                        <td>{formatLatency(entry.p99_latency_ms)}</td>
-                        <td>{formatTPS(entry.tps)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-                <div className="pagination" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '1rem', padding: '0.5rem' }}>
-                  <button 
-                    disabled={page === 1} 
-                    onClick={() => setPage(p => p - 1)}
-                    style={{ padding: '0.5rem 1rem', borderRadius: '4px', background: 'var(--border)', border: 'none', cursor: page === 1 ? 'not-allowed' : 'pointer' }}
-                  >
-                    Previous
-                  </button>
-                  <span>Page {page} of {totalPages}</span>
-                  <button 
-                    disabled={page === totalPages} 
-                    onClick={() => setPage(p => p + 1)}
-                    style={{ padding: '0.5rem 1rem', borderRadius: '4px', background: 'var(--border)', border: 'none', cursor: page === totalPages ? 'not-allowed' : 'pointer' }}
-                  >
-                    Next
-                  </button>
-                </div>
-              </>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="pagination" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '1.25rem', padding: '0 0.5rem' }}>
+              <button 
+                disabled={page === 1} 
+                onClick={() => setPage(p => p - 1)}
+                style={{
+                  padding: '0.5rem 1rem',
+                  borderRadius: '999px',
+                  background: page === 1 ? 'rgba(0,0,0,0.02)' : 'rgba(255,255,255,0.8)',
+                  border: '1px solid rgba(148,163,184,0.25)',
+                  color: page === 1 ? '#94a3b8' : 'var(--text-h)',
+                  cursor: page === 1 ? 'not-allowed' : 'pointer',
+                  fontWeight: '600',
+                  fontSize: '0.82rem',
+                  transition: 'all 0.15s ease'
+                }}
+              >
+                Previous
+              </button>
+              <span style={{ fontSize: '0.88rem', color: '#64748b', fontWeight: '500' }}>Page {page} of {totalPages}</span>
+              <button 
+                disabled={page === totalPages} 
+                onClick={() => setPage(p => p + 1)}
+                style={{
+                  padding: '0.5rem 1rem',
+                  borderRadius: '999px',
+                  background: page === totalPages ? 'rgba(0,0,0,0.02)' : 'rgba(255,255,255,0.8)',
+                  border: '1px solid rgba(148,163,184,0.25)',
+                  color: page === totalPages ? '#94a3b8' : 'var(--text-h)',
+                  cursor: page === totalPages ? 'not-allowed' : 'pointer',
+                  fontWeight: '600',
+                  fontSize: '0.82rem',
+                  transition: 'all 0.15s ease'
+                }}
+              >
+                Next
+              </button>
+            </div>
+          </>
+        )}
+      </section>
+
+      {/* Right Column: User Profile Card & Best Score */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
+        <article className="panel" style={{ borderRadius: '1.5rem', padding: '2rem', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '1rem', textAlign: 'center', background: 'rgba(255, 255, 255, 0.85)' }}>
+          <div className="nav-user-avatar" style={{ width: '80px', height: '80px', fontSize: '2.5rem', borderRadius: '50%', boxShadow: '0 8px 20px rgba(99, 102, 241, 0.25)' }}>
+            {profile.user.username.charAt(0).toUpperCase()}
+          </div>
+          <div>
+            <h2 style={{ fontSize: '1.75rem', fontWeight: '800', margin: '0 0 0.25rem 0', color: 'var(--text-h)' }}>{profile.user.username}</h2>
+            <p style={{ fontSize: '0.88rem', color: '#64748b', margin: 0 }}>{profile.user.email}</p>
+            {isMe && (
+              <span style={{ display: 'inline-block', marginTop: '0.5rem', padding: '0.25rem 0.75rem', borderRadius: '999px', background: 'rgba(37, 99, 235, 0.1)', color: '#2563eb', fontSize: '0.75rem', fontWeight: '700' }}>
+                Your Profile
+              </span>
             )}
           </div>
-        </div>
+        </article>
+
+        {bestScore ? (
+          <article className="panel" style={{ borderRadius: '1.5rem', padding: '1.75rem', display: 'flex', flexDirection: 'column', gap: '1rem', background: 'linear-gradient(135deg, rgba(255,255,255,0.95), rgba(248,250,252,0.95))' }}>
+            <span className="section-tag" style={{ color: '#2563eb', fontWeight: '800' }}>🏆 Personal Best</span>
+            
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: '0.25rem' }}>
+              <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.25rem' }}>
+                <strong style={{ fontSize: '3rem', fontWeight: '900', color: 'var(--text-h)', letterSpacing: '-0.04em', lineHeight: 1 }}>{bestScore.total_score.toFixed(1)}</strong>
+                <span style={{ fontSize: '1rem', color: '#64748b', fontWeight: '600' }}>/ 100</span>
+              </div>
+              <GradeBadge grade={bestScore.grade} />
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem', marginTop: '0.5rem', paddingTop: '1rem', borderTop: '1px solid rgba(148, 163, 184, 0.15)' }}>
+              <div>
+                <span style={{ display: 'block', fontSize: '0.75rem', color: '#64748b', fontWeight: '600', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Strategy</span>
+                <strong style={{ display: 'block', fontSize: '0.92rem', color: 'var(--text-h)', marginTop: '0.15rem' }}>{bestScore.strategy}</strong>
+              </div>
+              <div>
+                <span style={{ display: 'block', fontSize: '0.75rem', color: '#64748b', fontWeight: '600', textTransform: 'uppercase', letterSpacing: '0.05em' }}>P99 Latency</span>
+                <strong style={{ display: 'block', fontSize: '0.92rem', color: 'var(--text-h)', marginTop: '0.15rem' }}>{formatLatency(bestScore.p99_latency_ms)}</strong>
+              </div>
+              <div>
+                <span style={{ display: 'block', fontSize: '0.75rem', color: '#64748b', fontWeight: '600', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Throughput</span>
+                <strong style={{ display: 'block', fontSize: '0.92rem', color: 'var(--text-h)', marginTop: '0.15rem' }}>{formatTPS(bestScore.tps)} TPS</strong>
+              </div>
+              <div>
+                <span style={{ display: 'block', fontSize: '0.75rem', color: '#64748b', fontWeight: '600', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Correctness</span>
+                <strong style={{ display: 'block', fontSize: '0.92rem', color: 'var(--text-h)', marginTop: '0.15rem' }}>{(bestScore.correctness_score / 50 * 100).toFixed(0)}%</strong>
+              </div>
+            </div>
+
+            <div style={{ fontSize: '0.78rem', color: '#94a3b8', textAlign: 'right', marginTop: '0.25rem' }}>
+              Tested {new Date(bestScore.submitted_at).toLocaleDateString()}
+            </div>
+          </article>
+        ) : (
+          <article className="panel" style={{ borderRadius: '1.5rem', padding: '1.75rem', textAlign: 'center', background: 'rgba(255,255,255,0.7)' }}>
+            <span className="section-tag">🏆 Personal Best</span>
+            <p style={{ color: '#64748b', fontSize: '0.9rem', margin: '1.5rem 0' }}>No practice runs recorded yet.</p>
+          </article>
+        )}
       </div>
 
       <SubmissionDetail submission={selectedSubmission} onClose={() => setSelectedSubmission(null)} />

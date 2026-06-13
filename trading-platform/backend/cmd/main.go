@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -48,6 +49,7 @@ type stressTestRequest struct {
 	Protocol      string `json:"protocol"`
 	Strategy      string `json:"strategy"`
 	SystemName    string `json:"system_name"`
+	Language      string `json:"language"`
 	Bots          int    `json:"bots"`
 	Requests      int    `json:"requests"`
 	DurationSecs  int    `json:"duration_seconds"`
@@ -58,6 +60,8 @@ type stressTestRequest struct {
 	RampUpSecs    int    `json:"ramp_up_seconds"`
 	JudgingMode   string `json:"judging_mode"`
 	ContestID     string `json:"contest_id"`
+	ProblemID     string `json:"problem_id"`
+	Filename      string `json:"filename"`
 }
 
 func extensionForLanguage(language string) (string, error) {
@@ -143,7 +147,7 @@ func buildTargetURL(result sandbox.ExecutionResult, protocol string, containerPo
 
 	if sandbox.InCluster() {
 		host := fmt.Sprintf("%s.trading-sandbox.svc.cluster.local", result.ServiceName)
-		if proto == "tcp" {
+		if proto == "tcp" || proto == "fix" {
 			return fmt.Sprintf("%s:%d", host, containerPort)
 		}
 		return fmt.Sprintf("http://%s:%d", host, containerPort)
@@ -152,7 +156,7 @@ func buildTargetURL(result sandbox.ExecutionResult, protocol string, containerPo
 	// Running locally outside cluster: try to get minikube IP, fallback to 127.0.0.1.
 	// Use NodePort if available to support parallel executions, fallback to containerPort.
 	hostIP := "127.0.0.1"
-	if minikubeIP := os.Getenv("MINIKUBE_IP"); minikubeIP != "" && runtime.GOOS != "darwin" {
+	if minikubeIP := os.Getenv("MINIKUBE_IP"); minikubeIP != "" && runtime.GOOS == "linux" {
 		hostIP = minikubeIP
 	}
 
@@ -163,7 +167,7 @@ func buildTargetURL(result sandbox.ExecutionResult, protocol string, containerPo
 		portToUse = int(result.NodePort)
 	}
 
-	if proto == "tcp" {
+	if proto == "tcp" || proto == "fix" {
 		return fmt.Sprintf("%s:%d", hostIP, portToUse)
 	}
 	return fmt.Sprintf("http://%s:%d", hostIP, portToUse)
@@ -180,9 +184,14 @@ func runFinalization(ctx context.Context, contestID string, contest store.Contes
 	totalTeams := len(teams)
 
 	problems, _ := db.GetContestProblems(ctx, contestID)
-	hiddenStrategies := contest.FinalStrategies
-	if len(problems) > 0 && len(problems[0].HiddenStrategies) > 0 {
-		hiddenStrategies = problems[0].HiddenStrategies
+	var hiddenStrategies []string
+	if len(problems) > 0 {
+		for _, p := range problems {
+			hiddenStrategies = append(hiddenStrategies, p.HiddenStrategies...)
+		}
+	}
+	if len(hiddenStrategies) == 0 {
+		hiddenStrategies = contest.FinalStrategies
 	}
 
 	bestLiveScores, err := db.GetBestLiveScoresForContest(ctx, contestID)
@@ -196,67 +205,147 @@ func runFinalization(ctx context.Context, contestID string, contest store.Contes
 		var allScores, allLat, allThr, allCor, allP99, allTPS []float64
 
 		if best, ok := bestLiveScores[teamName]; ok {
-			allScores = append(allScores, best.TotalScore)
-			allLat = append(allLat, best.LatencyScore)
-			allThr = append(allThr, best.ThroughputScore)
-			allCor = append(allCor, best.CorrectnessScore)
-			allP99 = append(allP99, best.P99LatencyMs)
-			allTPS = append(allTPS, best.TPS)
+			// Do NOT append to allScores, allLat, etc. so it is not counted in finalized averages.
+			// Only include it in roundResults for display.
 			roundResults = append(roundResults, map[string]interface{}{
-				"label": fmt.Sprintf("Best Live (%s)", best.Strategy),
-				"score": best.TotalScore,
-				"grade": best.Grade,
+				"problem_code":  "Live",
+				"problem_title": "Best Live Score",
+				"strategy":      best.Strategy,
+				"label":         fmt.Sprintf("Best Live (%s)", best.Strategy),
+				"score":         best.TotalScore,
+				"grade":         best.Grade,
 			})
 		}
 
-		targetURL, err := sandbox.GetSandboxTargetURL(ctx, teamName)
-		if err != nil {
-			roundResults = append(roundResults, map[string]interface{}{
-				"label": "Hidden Strategies",
-				"score": 0.0,
-				"error": "sandbox not running — scored from live submissions only",
-			})
-		} else {
-			for i, stratName := range hiddenStrategies {
-				strategy := botfleet.NormalizeStrategy(stratName)
-				submissionID := fmt.Sprintf("finalize-%s-%d-%d", contestID, time.Now().UnixNano(), i)
-				seed := botfleet.DeterministicSeedForStrategy(strategy)
+		for _, p := range problems {
+			probStrategies := p.HiddenStrategies
+			if len(probStrategies) == 0 {
+				probStrategies = contest.FinalStrategies
+			}
+			if len(probStrategies) == 0 {
+				probStrategies = []string{"bbo_heavy", "flash_crash", "high_cancel", "iceberg", "momentum_burst"}
+			}
 
-				runCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-				metrics, runErr := botfleet.Run(runCtx, botfleet.Config{
-					Target: targetURL, Protocol: "http", Strategy: strategy, Bots: 32,
-					Requests: 0, Duration: 10 * time.Second, Timeout: 2 * time.Second,
-					Method: "POST", Path: "/", ExpectReply: true, RampUpDuration: 0,
-					TelemetryClient: nil, SubmissionID: submissionID,
-					JudgingMode: "contest_final", ContestID: contestID, Seed: seed,
-				})
-				cancel()
-				time.Sleep(1 * time.Second)
+			probProtocol := "http"
+			if p.HiddenProtocol != "" {
+				probProtocol = strings.ToLower(strings.TrimSpace(p.HiddenProtocol))
+			}
 
-				roundScore, roundLat, roundThr, roundCor, roundP99, roundTPS := 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-				roundGrade := "F"
+			var targetURL string
+			var cleanupFunc func()
 
-				if runErr == nil && metrics.Successes > 0 {
-					perfMetrics := scorer.PerformanceMetrics{
-						SubmissionID: submissionID, TotalRequests: metrics.Requests, Successes: metrics.Successes, Failures: metrics.Failures,
-						TPS: metrics.RequestsPerSecond, MinLatencyMs: metrics.MinLatencyMs, AvgLatencyMs: metrics.AverageLatencyMs,
-						P50LatencyMs: metrics.P50LatencyMs, P90LatencyMs: metrics.P90LatencyMs, P99LatencyMs: metrics.P99LatencyMs,
-						MaxLatencyMs: metrics.MaxLatencyMs, StdDevMs: metrics.StdDevMs,
-					}
-					valResult := validator.ValidationResult{}
-					sc := scorer.ComputeScore(perfMetrics, valResult)
-					roundScore, roundLat, roundThr, roundCor, roundGrade, roundP99, roundTPS = sc.TotalScore, sc.LatencyScore, sc.ThroughputScore, sc.CorrectnessScore, sc.Grade, perfMetrics.P99LatencyMs, perfMetrics.TPS
+			sub, subErr := db.GetLatestLiveSubmissionForTeamAndProblem(ctx, contestID, teamName, p.ID)
+			if subErr == nil && sub != nil && sub.SourceCode != "" {
+				log.Printf("[Finalize] Starting latest engine for team %s, problem %s (%s)...", teamName, p.Code, p.Title)
+				port := extractPortFromSourceCode([]byte(sub.SourceCode))
+				if port <= 0 {
+					port = 8080
 				}
 
-				if roundScore > 0 {
+				ext, extErr := extensionForLanguage(sub.Language)
+				if extErr == nil {
+					sanitizedSystem := sanitizeDNSName(teamName)
+					submissionName := fmt.Sprintf("finalize-%s-%s-%d-%s%s", sanitizedSystem, p.Code, time.Now().UnixNano(), randomString(4), ext)
+					filePath := filepath.Join("./workspace", submissionName)
+
+					if writeErr := os.WriteFile(filePath, []byte(sub.SourceCode), 0644); writeErr == nil {
+						execCtx, execCancel := context.WithTimeout(ctx, 135*time.Second)
+						res, execErr := sandbox.ExecuteCode(execCtx, filePath, sub.Language, port, teamName)
+						execCancel()
+						os.Remove(filePath)
+
+						if execErr == nil && res.Phase == "Running" {
+							targetURL = buildTargetURL(res, probProtocol, port)
+							cleanupFunc = func() {
+								log.Printf("[Finalize] Cleaning up sandbox for %s (problem %s): %s", teamName, p.Code, res.PodID)
+								_ = sandbox.CleanupSandbox(res.PodID)
+							}
+							log.Printf("[Finalize] Sandbox for %s (problem %s) successfully started at %s (NodePort: %d)", teamName, p.Code, targetURL, res.NodePort)
+						} else {
+							log.Printf("[Finalize] ExecuteCode failed to run sandbox for %s (problem %s): %v", teamName, p.Code, execErr)
+						}
+					} else {
+						log.Printf("[Finalize] Failed to write temp file for %s (problem %s): %v", teamName, p.Code, writeErr)
+					}
+				}
+			}
+
+			// Fallback if we couldn't launch the sandbox from DB source code
+			if targetURL == "" {
+				log.Printf("[Finalize] Warning: could not launch sandbox from source code for %s (problem %s), falling back to already running sandbox...", teamName, p.Code)
+				targetURL, _ = sandbox.GetSandboxTargetURL(ctx, teamName, probProtocol)
+			}
+
+			if targetURL == "" {
+				for _, stratName := range probStrategies {
+					allScores = append(allScores, 0.0)
+					allLat = append(allLat, 0.0)
+					allThr = append(allThr, 0.0)
+					allCor = append(allCor, 0.0)
+					allP99 = append(allP99, 0.0)
+					allTPS = append(allTPS, 0.0)
+					roundResults = append(roundResults, map[string]interface{}{
+						"problem_code":  p.Code,
+						"problem_title": p.Title,
+						"strategy":      stratName,
+						"label":         fmt.Sprintf("%s - %s", p.Code, stratName),
+						"score":         0.0,
+						"grade":         "F",
+						"error":         "no submission code and sandbox not running",
+					})
+				}
+			} else {
+				for i, stratName := range probStrategies {
+					strategy := botfleet.NormalizeStrategy(stratName)
+					submissionID := fmt.Sprintf("finalize-%s-%s-%d-%d", contestID, p.Code, time.Now().UnixNano(), i)
+					seed := botfleet.DeterministicSeedForStrategy(strategy)
+
+					runCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+					metrics, runErr := botfleet.Run(runCtx, botfleet.Config{
+						Target: targetURL, Protocol: botfleet.NormalizeProtocol(probProtocol), Strategy: strategy, Bots: 32,
+						Requests: 0, Duration: 10 * time.Second, Timeout: 2 * time.Second,
+						Method: "POST", Path: "/", ExpectReply: true, RampUpDuration: 0,
+						TelemetryClient: nil, SubmissionID: submissionID,
+						JudgingMode: "contest_final", ContestID: contestID, Seed: seed,
+					})
+					cancel()
+					time.Sleep(1 * time.Second)
+
+					roundScore, roundLat, roundThr, roundCor, roundP99, roundTPS := 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+					roundGrade := "F"
+
+					if runErr == nil && metrics.Successes > 0 {
+						perfMetrics := scorer.PerformanceMetrics{
+							SubmissionID: submissionID, TotalRequests: metrics.Requests, Successes: metrics.Successes, Failures: metrics.Failures,
+							TPS: metrics.RequestsPerSecond, MinLatencyMs: metrics.MinLatencyMs, AvgLatencyMs: metrics.AverageLatencyMs,
+							P50LatencyMs: metrics.P50LatencyMs, P90LatencyMs: metrics.P90LatencyMs, P99LatencyMs: metrics.P99LatencyMs,
+							MaxLatencyMs: metrics.MaxLatencyMs, StdDevMs: metrics.StdDevMs,
+						}
+						valResult := validator.ValidationResult{}
+						sc := scorer.ComputeScore(perfMetrics, valResult)
+						roundScore, roundLat, roundThr, roundCor, roundGrade, roundP99, roundTPS = sc.TotalScore, sc.LatencyScore, sc.ThroughputScore, sc.CorrectnessScore, sc.Grade, perfMetrics.P99LatencyMs, perfMetrics.TPS
+					}
+
 					allScores = append(allScores, roundScore)
 					allLat = append(allLat, roundLat)
 					allThr = append(allThr, roundThr)
 					allCor = append(allCor, roundCor)
 					allP99 = append(allP99, roundP99)
 					allTPS = append(allTPS, roundTPS)
+
+					roundResults = append(roundResults, map[string]interface{}{
+						"problem_code":  p.Code,
+						"problem_title": p.Title,
+						"strategy":      stratName,
+						"label":         fmt.Sprintf("%s - %s", p.Code, stratName),
+						"score":         roundScore,
+						"grade":         roundGrade,
+					})
 				}
-				roundResults = append(roundResults, map[string]interface{}{"label": stratName, "score": roundScore, "grade": roundGrade})
+
+				if cleanupFunc != nil {
+					cleanupFunc()
+				}
 			}
 		}
 
@@ -307,7 +396,9 @@ func main() {
 		}
 	}()
 
-	app := fiber.New()
+	app := fiber.New(fiber.Config{
+		BodyLimit: 100 * 1024 * 1024, // 100MB limit to support base64 contest banner images
+	})
 
 	// Enable CORS for frontend communication
 	app.Use(cors.New(cors.Config{
@@ -515,6 +606,52 @@ func main() {
 		})
 	})
 
+	app.Get("/users/:username/profile", func(c *fiber.Ctx) error {
+		if db == nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"message": "database not available"})
+		}
+		username := c.Params("username")
+		if strings.TrimSpace(username) == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "username is required"})
+		}
+
+		user, err := db.GetUserByUsername(c.Context(), username)
+		if err != nil {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"message": "user not found"})
+		}
+
+		page, _ := strconv.Atoi(c.Query("page", "1"))
+		pageSize, _ := strconv.Atoi(c.Query("pageSize", "10"))
+		if page < 1 {
+			page = 1
+		}
+		if pageSize < 1 || pageSize > 100 {
+			pageSize = 10
+		}
+
+		bestScore, err := db.GetBestScore(c.Context(), user.ID)
+		var bestScorePtr *store.SubmissionResult
+		if err == nil {
+			bestScorePtr = bestScore
+		}
+
+		history, total, err := db.GetPaginatedUserHistory(c.Context(), user.ID, page, pageSize)
+		if err != nil {
+			history = []store.SubmissionResult{}
+		}
+
+		return c.JSON(fiber.Map{
+			"user": fiber.Map{
+				"id":       user.ID,
+				"username": user.Username,
+				"email":    user.Email,
+			},
+			"best_score": bestScorePtr,
+			"history":    history,
+			"total":      total,
+		})
+	})
+
 	// User's own submission history (requires auth)
 	app.Get("/history/me", auth.AuthMiddleware(), func(c *fiber.Ctx) error {
 		if db == nil {
@@ -525,7 +662,10 @@ func main() {
 		if limit <= 0 || limit > 100 {
 			limit = 50
 		}
-		results, err := db.GetUserHistory(c.Context(), userID, limit)
+		contestID := c.Query("contest_id", "")
+		problemID := c.Query("problem_id", "")
+		judgingMode := c.Query("judging_mode", "")
+		results, err := db.GetUserHistory(c.Context(), userID, contestID, problemID, judgingMode, limit)
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "history query failed", "error": err.Error()})
 		}
@@ -587,7 +727,6 @@ func main() {
 		}
 		return c.JSON(result)
 	})
-
 	// The endpoint where contestants submit their code
 	app.Post("/submit", auth.AuthMiddleware(), func(c *fiber.Ctx) error {
 		defer func() {
@@ -643,13 +782,36 @@ func main() {
 		}
 		// Ensure host disk cleanup once this request returns
 		defer os.Remove(filePath)
-		sourceCodeBytes, _ := os.ReadFile(filePath)
+		sourceCodeBytes, err := os.ReadFile(filePath)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "failed to read uploaded file", "error": err.Error()})
+		}
+		if len(sourceCodeBytes) == 0 {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "uploaded source_code file is empty"})
+		}
+
+		// Verify port and protocol match the uploaded source code.
+		if detectedPort := extractPortFromSourceCode(sourceCodeBytes); detectedPort > 0 {
+			if detectedPort != port {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+					"message": fmt.Sprintf("The port specified in the form (%d) does not match the port detected in your source code (%d). Please match them.", port, detectedPort),
+				})
+			}
+		}
+
+		if detectedProto := detectProtocolFromSourceCode(sourceCodeBytes); detectedProto != "" {
+			if detectedProto != protocol {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+					"message": fmt.Sprintf("The protocol specified in the form (%s) does not match the protocol detected in your source code (%s). Please match them.", protocol, detectedProto),
+				})
+			}
+		}
 
 		fmt.Println("Attempting to start sandbox for:", filePath)
 
-		// Execute sandbox with timeout context — increased to 75s because
-		// waitForPodReady can take up to 60s for compilation + startup.
-		ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+		// Execute sandbox with timeout context — increased to 135s because
+		// waitForPodReady can take up to 120s for compilation + startup.
+		ctx, cancel := context.WithTimeout(context.Background(), 135*time.Second)
 		defer cancel()
 
 		// Channel-based result passing eliminates the data race that occurred
@@ -758,6 +920,21 @@ func main() {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "target is required"})
 		}
 
+		targetURL := req.Target
+		defer func() {
+			go func() {
+				// Wait 1.5 seconds to allow any pending telemetry to flush before pod is destroyed
+				time.Sleep(1500 * time.Millisecond)
+				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cleanupCancel()
+				if err := sandbox.CleanupSandboxByTarget(cleanupCtx, targetURL); err != nil {
+					log.Printf("Auto-cleanup sandbox error for target %s: %v", targetURL, err)
+				} else {
+					log.Printf("Auto-cleanup sandbox success for target %s", targetURL)
+				}
+			}()
+		}()
+
 		if req.ContestID != "" && db != nil {
 			contest, err := db.GetContest(c.Context(), req.ContestID)
 			if err != nil {
@@ -787,12 +964,15 @@ func main() {
 
 		// --- Helper: run one stress-test round and score it ---
 		type roundResult struct {
-			SubmissionID string          `json:"submission_id"`
-			Strategy     string          `json:"strategy"`
-			JudgingMode  string          `json:"judging_mode"`
-			SeedUsed     int64           `json:"seed_used"`
-			Metrics      botfleet.Summary `json:"metrics"`
-			Score        *scorer.Score   `json:"score,omitempty"`
+			SubmissionID     string                      `json:"submission_id"`
+			Strategy         string                      `json:"strategy"`
+			JudgingMode      string                      `json:"judging_mode"`
+			SeedUsed         int64                       `json:"seed_used"`
+			Metrics          botfleet.Summary            `json:"metrics"`
+			Score            *scorer.Score               `json:"score,omitempty"`
+			PerfMetrics      *scorer.PerformanceMetrics  `json:"perf_metrics,omitempty"`
+			ValResult        *validator.ValidationResult `json:"val_result,omitempty"`
+			CorrectnessHint  string                      `json:"correctness_hint,omitempty"`
 		}
 		runRound := func(strategy botfleet.Strategy, idSuffix string) (roundResult, error) {
 			submissionID := fmt.Sprintf("stress-%d%s", time.Now().UnixNano(), idSuffix)
@@ -841,14 +1021,14 @@ func main() {
 				var sc scorer.Score
 				var perfMetrics scorer.PerformanceMetrics
 				var valResult validator.ValidationResult
-				hasScored := false
 
 				if consumeErr == nil && len(events) > 0 {
 					perfMetrics = scorer.ComputeMetrics(submissionID, events)
 					valResult = validator.RunValidatorFromEvents(submissionID, events)
 					sc = scorer.ComputeScore(perfMetrics, valResult)
 					rr.Score = &sc
-					hasScored = true
+					rr.PerfMetrics = &perfMetrics
+					rr.ValResult = &valResult
 				} else {
 					// Fallback to botfleet Summary metrics if telemetry events are missing
 					sc = scorer.Score{
@@ -873,28 +1053,15 @@ func main() {
 						sc = scorer.ComputeScore(perfMetrics, valResult)
 					}
 					rr.Score = &sc
-					hasScored = true
+					rr.PerfMetrics = &perfMetrics
+					rr.ValResult = &valResult
 				}
 
-				if hasScored && db != nil {
-					// Extract user_id from the request context (set by auth middleware)
-					submitUserID := ""
-					if uid, ok := c.Locals("user_id").(string); ok {
-						submitUserID = uid
-					}
-					sourceCodeStr := ""
-					if src, ok := sourceCodeMap.LoadAndDelete(req.Target); ok {
-						if str, valid := src.(string); valid {
-							sourceCodeStr = str
-						}
-					}
-					sr := store.NewSubmissionResultWithMode(
-						submissionID, systemName, string(strategy), "", submitUserID, sourceCodeStr,
-						sc, perfMetrics, valResult,
-						string(judgingMode), req.ContestID, nil, seed,
-					)
-					if storeErr := db.CreateSubmissionResult(scoreCtx, sr); storeErr != nil {
-						log.Printf("WARNING: failed to persist scoring result for %s: %v", strategy, storeErr)
+				isRust := strings.ToLower(strings.TrimSpace(req.Language)) == "rust"
+				isZeroCorrectness := rr.Score == nil || rr.Score.CorrectnessScore == 0
+				if !isRust && isZeroCorrectness {
+					if hint := valResult.CorrectnessHint(); hint != "" {
+						rr.CorrectnessHint = hint
 					}
 				}
 			}
@@ -902,23 +1069,160 @@ func main() {
 			return rr, nil
 		}
 
-		// --- Run the user's selected strategy ---
-		log.Printf("Running stress test: strategy=%s system_name=%q", userStrategy, systemName)
-		userRound, err := runRound(userStrategy, "")
-		if err != nil {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "stress test failed", "error": err.Error()})
+		// Retrieve sample strategies for this problem
+		var sampleStrategies []string
+		if req.ContestID != "" && req.ProblemID != "" && db != nil {
+			probs, err := db.GetContestProblems(c.Context(), req.ContestID)
+			if err == nil {
+				for _, p := range probs {
+					if p.ID == req.ProblemID {
+						sampleStrategies = p.SampleStrategies
+						break
+					}
+				}
+			}
+		}
+		if len(sampleStrategies) == 0 {
+			sampleStrategies = []string{req.Strategy}
 		}
 
-		rounds := []roundResult{userRound}
-
-		// --- If user did NOT pick bbo_heavy, also run the default baseline ---
-		if userStrategy != botfleet.StrategyBBOHeavy {
-			log.Printf("Running baseline bbo_heavy stress test for %q", systemName)
-			bboRound, err := runRound(botfleet.StrategyBBOHeavy, "-bbo")
+		// --- Run the appropriate strategies ---
+		var rounds []roundResult
+		if req.ContestID != "" && db != nil {
+			log.Printf("Running contest stress test on problem %s sample strategies: %v, system_name=%q", req.ProblemID, sampleStrategies, systemName)
+			for i, strat := range sampleStrategies {
+				strategyEnum := botfleet.NormalizeStrategy(strat)
+				suffix := ""
+				if len(sampleStrategies) > 1 {
+					suffix = fmt.Sprintf("-%d", i+1)
+				}
+				round, err := runRound(strategyEnum, suffix)
+				if err != nil {
+					return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "stress test failed", "error": err.Error()})
+				}
+				rounds = append(rounds, round)
+			}
+		} else {
+			log.Printf("Running stress test: strategy=%s system_name=%q", userStrategy, systemName)
+			userRound, err := runRound(userStrategy, "")
 			if err != nil {
-				log.Printf("WARNING: baseline bbo_heavy run failed: %v", err)
-			} else {
-				rounds = append(rounds, bboRound)
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "stress test failed", "error": err.Error()})
+			}
+			rounds = append(rounds, userRound)
+
+			if userStrategy != botfleet.StrategyBBOHeavy {
+				log.Printf("Running baseline bbo_heavy stress test for %q", systemName)
+				bboRound, err := runRound(botfleet.StrategyBBOHeavy, "-bbo")
+				if err == nil {
+					rounds = append(rounds, bboRound)
+				}
+			}
+		}
+
+		// Save aggregated results to the database if rounds were successfully run
+		if len(rounds) > 0 && db != nil {
+			submitUserID := ""
+			if uid, ok := c.Locals("user_id").(string); ok {
+				submitUserID = uid
+			}
+			sourceCodeStr := ""
+			if src, ok := sourceCodeMap.LoadAndDelete(req.Target); ok {
+				if str, valid := src.(string); valid {
+					sourceCodeStr = str
+				}
+			}
+
+			// Aggregate scores and metrics
+			var totalScore, latencyScore, throughputScore, correctnessScore float64
+			var totalTPS, totalP99 float64
+			var totalCrossEvents, totalOrdersProcessed int
+			var scoredCount int
+
+			for _, r := range rounds {
+				if r.Score != nil {
+					totalScore += r.Score.TotalScore
+					latencyScore += r.Score.LatencyScore
+					throughputScore += r.Score.ThroughputScore
+					correctnessScore += r.Score.CorrectnessScore
+					scoredCount++
+				}
+				if r.PerfMetrics != nil {
+					totalTPS += r.PerfMetrics.TPS
+					totalP99 += r.PerfMetrics.P99LatencyMs
+				}
+				if r.ValResult != nil {
+					totalCrossEvents += r.ValResult.CrossEvents
+					totalOrdersProcessed += r.ValResult.OrdersProcessed
+				}
+			}
+
+			avgTotalScore := 0.0
+			avgLatencyScore := 0.0
+			avgThroughputScore := 0.0
+			avgCorrectnessScore := 0.0
+			avgTPS := 0.0
+			avgP99 := 0.0
+
+			if scoredCount > 0 {
+				avgTotalScore = totalScore / float64(scoredCount)
+				avgLatencyScore = latencyScore / float64(scoredCount)
+				avgThroughputScore = throughputScore / float64(scoredCount)
+				avgCorrectnessScore = correctnessScore / float64(scoredCount)
+				avgTPS = totalTPS / float64(scoredCount)
+				avgP99 = totalP99 / float64(scoredCount)
+			}
+
+			overallGrade := scorer.AssignGrade(avgTotalScore)
+
+			overallVal := validator.ValidationResult{
+				SubmissionID:    rounds[0].SubmissionID,
+				CrossEvents:     totalCrossEvents,
+				OrdersProcessed: totalOrdersProcessed,
+				Valid:           totalCrossEvents == 0,
+			}
+
+			// Package rounds in raw_metrics
+			type multiStrategyPayload struct {
+				IsMultiStrategy bool           `json:"is_multi_strategy"`
+				Rounds          []roundResult  `json:"rounds"`
+			}
+			payload := multiStrategyPayload{
+				IsMultiStrategy: len(rounds) > 1,
+				Rounds:          rounds,
+			}
+			rawMetricsJSON, _ := json.Marshal(payload)
+			rawValidationJSON, _ := json.Marshal(overallVal)
+
+			sr := store.SubmissionResult{
+				SubmissionID:     rounds[0].SubmissionID,
+				SystemName:       systemName,
+				Strategy:         req.Strategy,
+				Language:         req.Language,
+				SubmittedAt:      time.Now().UTC(),
+				TotalScore:       avgTotalScore,
+				LatencyScore:     avgLatencyScore,
+				ThroughputScore:  avgThroughputScore,
+				CorrectnessScore: avgCorrectnessScore,
+				Grade:            overallGrade,
+				P99LatencyMs:     avgP99,
+				TPS:              avgTPS,
+				CrossEvents:      totalCrossEvents,
+				OrdersProcessed:  totalOrdersProcessed,
+				RawMetrics:       rawMetricsJSON,
+				RawValidation:    rawValidationJSON,
+				JudgingMode:      string(judgingMode),
+				ContestID:        req.ContestID,
+				UserID:           submitUserID,
+				SourceCode:       sourceCodeStr,
+				ProblemID:        req.ProblemID,
+				SeedUsed:         rounds[0].SeedUsed,
+				Filename:         req.Filename,
+			}
+
+			scoreCtx, scoreCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer scoreCancel()
+			if storeErr := db.CreateSubmissionResult(scoreCtx, sr); storeErr != nil {
+				log.Printf("WARNING: failed to persist combined scoring result: %v", storeErr)
 			}
 		}
 
@@ -1072,6 +1376,7 @@ func main() {
 				RegistrationDeadline string `json:"registrationDeadline"`
 				Strategy             string `json:"strategy"`
 				FinalStrategies      []string `json:"finalStrategies"`
+				BannerPreview        string `json:"bannerPreview"`
 			} `json:"details"`
 			Problems []struct {
 				ID                    string `json:"id"`
@@ -1128,8 +1433,59 @@ func main() {
 			}
 		}
 
-		if startTime.Before(time.Now().Add(-1 * time.Minute)) {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "contest start time cannot be in the past"})
+		log.Printf("[PublishContest] payload Details ID: %q, StartTime: %v", payload.Details.ID, payload.Details.StartTime)
+		var existingContest store.Contest
+		var contestExists bool
+		if db != nil && payload.Details.ID != "" {
+			ec, err := db.GetContest(c.Context(), payload.Details.ID)
+			if err != nil {
+				log.Printf("[PublishContest] GetContest error: %v", err)
+			} else {
+				existingContest = ec
+				contestExists = true
+				log.Printf("[PublishContest] Found existing contest. ID: %s, StartTime: %v", ec.ID, ec.StartTime)
+			}
+		}
+
+		hasStarted := false
+		if contestExists {
+			hasStarted = existingContest.StartTime.Before(time.Now())
+			log.Printf("[PublishContest] hasStarted calculated: %v (existing StartTime: %v, time.Now: %v)", hasStarted, existingContest.StartTime, time.Now())
+		}
+
+		if hasStarted {
+			// Block changing the banner after the contest has started
+			if payload.Details.BannerPreview != existingContest.Banner {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "cannot change contest banner after the contest has started"})
+			}
+
+			// Ensure startTime is not modified (compare at minute-level resolution to account for seconds/milliseconds truncation in HTML input)
+			if startTime.Unix()/60 != existingContest.StartTime.Unix()/60 {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "cannot change start time of an ongoing or completed contest"})
+			}
+
+			// Validate problems: do not allow adding new ones, and do not allow editing post-contest evaluation
+			existingProblems, err := db.GetContestProblems(c.Context(), payload.Details.ID)
+			if err != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "failed to query existing problems", "error": err.Error()})
+			}
+
+			existingIDs := make(map[string]store.ProblemData)
+			for _, ep := range existingProblems {
+				existingIDs[ep.ID] = ep
+			}
+
+			// Check if any new problems are added
+			for _, p := range payload.Problems {
+				_, exists := existingIDs[p.ID]
+				if !exists {
+					return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "cannot add new problems after the contest has started"})
+				}
+			}
+		} else {
+			if startTime.Before(time.Now().Add(-1 * time.Minute)) {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "contest start time cannot be in the past"})
+			}
 		}
 
 		var regDeadline *time.Time
@@ -1189,6 +1545,7 @@ func main() {
 		err = db.PublishContest(c.Context(), contestID,
 			payload.Details.Name, payload.Details.Description, payload.Details.Visibility, payload.Details.Code,
 			startTime, payload.Details.DurationMinutes, regDeadline, payload.Details.Strategy, payload.Details.FinalStrategies, problemsData, createdBy,
+			payload.Details.BannerPreview,
 		)
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "failed to publish contest", "error": err.Error()})
@@ -1228,6 +1585,20 @@ func main() {
 		return c.JSON(fiber.Map{
 			"details": contest,
 			"problems": problems,
+		})
+	})
+
+	app.Get("/contests/:id/participants", func(c *fiber.Ctx) error {
+		if db == nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"message": "database not available"})
+		}
+		contestID := c.Params("id")
+		teams, err := db.GetContestRegistrations(c.Context(), contestID)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "failed to get registrations", "error": err.Error()})
+		}
+		return c.JSON(fiber.Map{
+			"participants": teams,
 		})
 	})
 
@@ -1360,20 +1731,26 @@ func main() {
 		// This is a simplified version that demonstrates the finalization flow.
 		log.Printf("[Finalize] Starting finalization for contest %s with %d teams", contestID, len(teams))
 
-		// Build FinalRounds array from contest.FinalStrategies
+		// Build FinalRounds array from chosen strategies per problem
+		problems, _ := db.GetContestProblems(c.Context(), contestID)
 		var finalRounds []botfleet.FinalRoundDef
-		if len(contest.FinalStrategies) > 0 {
-			for i, strat := range contest.FinalStrategies {
-				// Deterministic but strategy-specific seed
+		for _, p := range problems {
+			probStrategies := p.HiddenStrategies
+			if len(probStrategies) == 0 {
+				probStrategies = contest.FinalStrategies
+			}
+			if len(probStrategies) == 0 {
+				probStrategies = []string{"bbo_heavy", "flash_crash", "high_cancel", "iceberg", "momentum_burst"}
+			}
+
+			for i, strat := range probStrategies {
 				seed := int64(0xF10A0000) + int64(i+1)
 				finalRounds = append(finalRounds, botfleet.FinalRoundDef{
 					Strategy: botfleet.Strategy(strat),
 					Seed:     seed,
-					Label:    strat,
+					Label:    fmt.Sprintf("%s - %s", p.Code, strat),
 				})
 			}
-		} else {
-			finalRounds = botfleet.DefaultFinalRounds
 		}
 
 		// Run finalization in background so the HTTP request doesn't timeout
@@ -1383,7 +1760,7 @@ func main() {
 			"message":    "Finalization started",
 			"contest_id": contestID,
 			"teams":      len(teams),
-			"rounds":     len(botfleet.DefaultFinalRounds),
+			"rounds":     len(finalRounds),
 		})
 	})
 
@@ -1399,6 +1776,13 @@ func main() {
 			limit = 50
 		}
 
+		phase := ""
+		if db != nil {
+			if contest, err := db.GetContest(c.Context(), contestID); err == nil {
+				phase = contest.Phase
+			}
+		}
+
 		finalScores, liveScores, err := db.GetContestLeaderboard(c.Context(), contestID, limit)
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "leaderboard query failed", "error": err.Error()})
@@ -1407,12 +1791,14 @@ func main() {
 		if finalScores != nil {
 			return c.JSON(fiber.Map{
 				"type":        "final",
+				"phase":       phase,
 				"contest_id":  contestID,
 				"leaderboard": finalScores,
 			})
 		}
 		return c.JSON(fiber.Map{
 			"type":        "live",
+			"phase":       phase,
 			"contest_id":  contestID,
 			"leaderboard": liveScores,
 		})
@@ -1444,3 +1830,87 @@ func main() {
 	log.Println("Platform API running on port 3001")
 	log.Fatal(app.Listen(":3001"))
 }
+
+func extractPortFromSourceCode(content []byte) int {
+	s := string(content)
+
+	// 1. #define PORT 8080 or #define port 8080
+	reDefine := regexp.MustCompile(`(?i)#define\s+ports?\s+(\d{2,5})\b`)
+	if m := reDefine.FindStringSubmatch(s); len(m) > 1 {
+		if p, err := strconv.Atoi(m[1]); err == nil && p >= 1 && p <= 65535 {
+			return p
+		}
+	}
+
+	// 2. Assignment like port = 8080, port := 8080, let port = 8080, const int port = 8080, PORT = 8080
+	reAssign := regexp.MustCompile(`(?i)\bports?\b\s*(?::\s*[a-z0-9_]+)?\s*(::?=|=)\s*(\d{2,5})\b`)
+	if m := reAssign.FindStringSubmatch(s); len(m) > 2 {
+		if p, err := strconv.Atoi(m[2]); err == nil && p >= 1 && p <= 65535 {
+			return p
+		}
+	}
+
+	// 3. htons(8080)
+	reHtons := regexp.MustCompile(`(?i)htons\(\s*(\d{2,5})\s*\)`)
+	if m := reHtons.FindStringSubmatch(s); len(m) > 1 {
+		if p, err := strconv.Atoi(m[1]); err == nil && p >= 1 && p <= 65535 {
+			return p
+		}
+	}
+
+	// 4. Bind string literals like ":9090" or "0.0.0.0:8080"
+	reAddr := regexp.MustCompile(`["'](?:[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})?:(\d{2,5})["']`)
+	if m := reAddr.FindStringSubmatch(s); len(m) > 1 {
+		if p, err := strconv.Atoi(m[1]); err == nil && p >= 1 && p <= 65535 {
+			return p
+		}
+	}
+
+	return 0
+}
+
+func detectProtocolFromSourceCode(content []byte) string {
+	s := string(content)
+	sLower := strings.ToLower(s)
+
+	// 1. FIX check
+	if strings.Contains(sLower, "quickfix") || strings.Contains(sLower, "8=fix") || strings.Contains(sLower, "fix.4.") || strings.Contains(sLower, "35=") {
+		return "fix"
+	}
+
+	// 2. HTTP check
+	if strings.Contains(s, "HTTP/1.1") || strings.Contains(s, "HTTP/1.0") || 
+		strings.Contains(sLower, "content-length:") || 
+		strings.Contains(sLower, "net/http") || 
+		strings.Contains(sLower, "gin-gonic") || 
+		strings.Contains(sLower, "gofiber") || 
+		strings.Contains(sLower, "crow.h") || 
+		strings.Contains(sLower, "httplib.h") || 
+		strings.Contains(sLower, "crow_all.h") {
+		return "http"
+	}
+
+	// 3. TCP check
+	if strings.Contains(sLower, "tcp") || 
+		strings.Contains(s, "SOCK_STREAM") || 
+		strings.Contains(sLower, "net.listen") || 
+		strings.Contains(sLower, "tcplistener") || 
+		strings.Contains(sLower, "socket(") {
+		return "tcp"
+	}
+
+	return ""
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+

@@ -20,7 +20,7 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Connection", "close")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ok"}`))
+		w.Write([]byte(`{"status":"ok","best_bid":0.0,"best_ask":0.0}`))
 	})
 
 	server := &http.Server{Addr: fmt.Sprintf("0.0.0.0:%d", port)}

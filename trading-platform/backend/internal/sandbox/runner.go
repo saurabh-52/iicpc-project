@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -93,6 +94,7 @@ func ExecuteCode(ctx context.Context, filePath string, language string, port int
 	if err != nil {
 		return ExecutionResult{}, fmt.Errorf("failed to read source file: %v", err)
 	}
+	fmt.Printf("runner.go: read %d bytes from source file %s\n", len(sourceBytes), absPath)
 
 	podID, serviceName, err := createSandboxPod(ctx, clientset, filepath.Base(absPath), string(sourceBytes), spec, port, systemName)
 	if err != nil {
@@ -102,7 +104,7 @@ func ExecuteCode(ctx context.Context, filePath string, language string, port int
 	// Wait for the pod to be Ready (engine compiled and listening) instead of
 	// waiting for it to terminate.  Trading engines are long-running servers
 	// and will never reach the Succeeded phase on their own.
-	phase, waitErr := waitForPodReady(ctx, clientset, "trading-sandbox", podID, 60*time.Second)
+	phase, waitErr := waitForPodReady(ctx, clientset, "trading-sandbox", podID, 120*time.Second)
 
 	// Collect whatever logs are available (startup output, compilation errors).
 	output, logErr := getPodLogs(ctx, clientset, "trading-sandbox", podID)
@@ -121,6 +123,20 @@ func ExecuteCode(ctx context.Context, filePath string, language string, port int
 		if phase == "" {
 			phase = "Unknown"
 		}
+		// Clean up the failed/pending sandbox resources immediately so the port is freed
+		fmt.Printf("Cleaning up failed sandbox pod %s (phase: %s)\n", podID, phase)
+		_ = CleanupSandbox(podID)
+		
+		return ExecutionResult{
+			PodID:       podID,
+			ServiceName: serviceName,
+			Phase:       phase,
+			Output:      strings.TrimSpace(output),
+			NodePort:    nodePort,
+		}, waitErr
+	} else if phase == "Running" {
+		// Start a background watcher to clean up resources immediately if the pod terminates after it started successfully
+		go watchAndCleanupPod(clientset, "trading-sandbox", podID)
 	}
 
 	if npErr != nil {
@@ -183,9 +199,10 @@ func createSandboxPod(ctx context.Context, clientset *kubernetes.Clientset, file
 			Containers: []corev1.Container{
 				{
 					Name:    "sandbox",
-					Image:   spec.image,
-					Command: []string{"sh", "-lc"},
-					Args:    []string{spec.command},
+					Image:           spec.image,
+					ImagePullPolicy: corev1.PullIfNotPresent,
+					Command:         []string{"sh", "-lc"},
+					Args:            []string{spec.command},
 					Ports: []corev1.ContainerPort{
 						{
 							ContainerPort: int32(port),
@@ -198,8 +215,8 @@ func createSandboxPod(ctx context.Context, clientset *kubernetes.Clientset, file
 							corev1.ResourceMemory: resource.MustParse("256Mi"),
 						},
 						Limits: corev1.ResourceList{
-							corev1.ResourceCPU:    resource.MustParse("1"),
-							corev1.ResourceMemory: resource.MustParse("512Mi"),
+							corev1.ResourceCPU:    resource.MustParse("2"),
+							corev1.ResourceMemory: resource.MustParse("1Gi"),
 						},
 					},
 					// TCP readiness probe: the pod is considered Ready only
@@ -211,10 +228,10 @@ func createSandboxPod(ctx context.Context, clientset *kubernetes.Clientset, file
 								Port: intstr.FromInt(port),
 							},
 						},
-						InitialDelaySeconds: 3,
+						InitialDelaySeconds: 5,
 						PeriodSeconds:       2,
 						TimeoutSeconds:      1,
-						FailureThreshold:    25,
+						FailureThreshold:    60,
 						SuccessThreshold:    1,
 					},
 					VolumeMounts: []corev1.VolumeMount{
@@ -498,8 +515,41 @@ func cleanupUserSandboxes(ctx context.Context, clientset *kubernetes.Clientset, 
 		}
 	}
 
-	// Give K8s a moment to release resources
-	time.Sleep(1 * time.Second)
+	// Give K8s a moment to release resources and wait for deletion to complete
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		pods, err1 := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+		svcs, err2 := clientset.CoreV1().Services(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+		
+		podCount := 0
+		if err1 == nil {
+			podCount = len(pods.Items)
+		}
+		svcCount := 0
+		if err2 == nil {
+			svcCount = len(svcs.Items)
+		}
+		
+		if podCount == 0 && svcCount == 0 {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// CleanupUserSandboxes removes existing sandbox pods, services, and configmaps
+// that match the given system name.
+func CleanupUserSandboxes(ctx context.Context, systemName string) error {
+	config, err := getKubernetesConfig()
+	if err != nil {
+		return fmt.Errorf("failed to get kubernetes config: %v", err)
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return fmt.Errorf("failed to create kubernetes client: %v", err)
+	}
+	cleanupUserSandboxes(ctx, clientset, "trading-sandbox", systemName)
+	return nil
 }
 
 // sanitizeDNSName sanitizes a string to be a valid DNS subdomain name and K8s label value.
@@ -561,19 +611,87 @@ func CleanupSandbox(podID string) error {
 	var errs []string
 
 	if err := clientset.CoreV1().Pods(namespace).Delete(ctx, podID, metav1.DeleteOptions{}); err != nil {
-		errs = append(errs, fmt.Sprintf("pod: %v", err))
+		if !strings.Contains(strings.ToLower(err.Error()), "not found") {
+			errs = append(errs, fmt.Sprintf("pod: %v", err))
+		}
 	}
 	if err := clientset.CoreV1().Services(namespace).Delete(ctx, serviceName, metav1.DeleteOptions{}); err != nil {
-		errs = append(errs, fmt.Sprintf("service: %v", err))
+		if !strings.Contains(strings.ToLower(err.Error()), "not found") {
+			errs = append(errs, fmt.Sprintf("service: %v", err))
+		}
 	}
 	if err := clientset.CoreV1().ConfigMaps(namespace).Delete(ctx, configMapName, metav1.DeleteOptions{}); err != nil {
-		errs = append(errs, fmt.Sprintf("configmap: %v", err))
+		if !strings.Contains(strings.ToLower(err.Error()), "not found") {
+			errs = append(errs, fmt.Sprintf("configmap: %v", err))
+		}
 	}
 
 	if len(errs) > 0 {
 		return fmt.Errorf("cleanup errors: %s", strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+// CleanupSandboxByTarget cleans up the sandbox pod, service, and configmap associated with the given target URL.
+func CleanupSandboxByTarget(ctx context.Context, target string) error {
+	urlStr := target
+	if strings.HasPrefix(urlStr, "http://") {
+		urlStr = urlStr[7:]
+	} else if strings.HasPrefix(urlStr, "https://") {
+		urlStr = urlStr[8:]
+	}
+
+	host, portStr, err := net.SplitHostPort(urlStr)
+	if err != nil {
+		host = urlStr
+	}
+
+	config, err := getKubernetesConfig()
+	if err != nil {
+		return fmt.Errorf("failed to get kubernetes config: %v", err)
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return fmt.Errorf("failed to create kubernetes client: %v", err)
+	}
+
+	namespace := "trading-sandbox"
+	var podID string
+
+	if strings.Contains(host, "trading-sandbox.svc.cluster.local") {
+		svcHost := strings.Split(host, ".")[0]
+		podID = strings.TrimSuffix(svcHost, "-svc")
+	} else if host == "127.0.0.1" || host == "localhost" || net.ParseIP(host) != nil {
+		if portStr != "" {
+			portVal, err := strconv.Atoi(portStr)
+			if err == nil {
+				svcList, err := clientset.CoreV1().Services(namespace).List(ctx, metav1.ListOptions{
+					LabelSelector: "app=trading-sandbox",
+				})
+				if err == nil {
+					for _, svc := range svcList.Items {
+						for _, p := range svc.Spec.Ports {
+							if p.NodePort == int32(portVal) || p.Port == int32(portVal) {
+								podID = strings.TrimSuffix(svc.Name, "-svc")
+								break
+							}
+						}
+						if podID != "" {
+							break
+						}
+					}
+				}
+			}
+		}
+	} else {
+		podID = strings.TrimSuffix(host, "-svc")
+	}
+
+	if podID == "" {
+		return fmt.Errorf("could not identify sandbox pod for target %s", target)
+	}
+
+	return CleanupSandbox(podID)
 }
 
 func buildSandboxSpec(absPath string, language string, port int) (sandboxSpec, error) {
@@ -583,25 +701,25 @@ func buildSandboxSpec(absPath string, language string, port int) (sandboxSpec, e
 	switch normalizedLanguage {
 	case "cpp", "c++", "cc", "cxx":
 		return sandboxSpec{
-			image:   "gcc:latest",
+			image:   "gcc@sha256:6a251e45411969f95e57f2587563dfba89d449798b80504bcebc7fad6f210200",
 			command: fmt.Sprintf("g++ /app/%s -o /tmp/run && /tmp/run", fileName),
 			port:    port,
 		}, nil
 	case "go":
 		return sandboxSpec{
-			image:   "golang:latest",
+			image:   "golang@sha256:87a41d2539e5671777734e91f467499ed5eafb1fb1f77221dff2744db7a51775",
 			command: fmt.Sprintf("/usr/local/go/bin/go run /app/%s", fileName),
 			port:    port,
 		}, nil
 	case "rust":
 		return sandboxSpec{
-			image:   "rust:latest",
+			image:   "rust@sha256:39d8cb39a54e7d1da665c4fabfdd265e532a5f836c11ab5aee27fd5c73891ce4",
 			command: fmt.Sprintf("/usr/local/cargo/bin/rustc /app/%s -o /tmp/run && /tmp/run", fileName),
 			port:    port,
 		}, nil
 	case "python", "py":
 		return sandboxSpec{
-			image:   "python:3.12-slim",
+			image:   "python@sha256:401f6e1a67dad31a1bd78e9ad22d0ee0a3b52154e6bd30e90be696bb6a3d7461",
 			command: fmt.Sprintf("python /app/%s", fileName),
 			port:    port,
 		}, nil
@@ -610,8 +728,8 @@ func buildSandboxSpec(absPath string, language string, port int) (sandboxSpec, e
 	}
 }
 
-// GetSandboxTargetURL finds the running sandbox pod/service for a given system name and returns its HTTP target URL.
-func GetSandboxTargetURL(ctx context.Context, systemName string) (string, error) {
+// GetSandboxTargetURL finds the running sandbox pod/service for a given system name and returns its target URL.
+func GetSandboxTargetURL(ctx context.Context, systemName string, protocol string) (string, error) {
 	config, err := getKubernetesConfig()
 	if err != nil {
 		return "", fmt.Errorf("failed to get k8s config: %v", err)
@@ -658,8 +776,36 @@ func GetSandboxTargetURL(ctx context.Context, systemName string) (string, error)
 
 	svc := svcList.Items[0]
 
+	// Get port from service
+	var servicePort int32 = 8080
+	for _, p := range svc.Spec.Ports {
+		if p.Port > 0 {
+			servicePort = p.Port
+			break
+		}
+	}
+
+	proto := strings.ToLower(strings.TrimSpace(protocol))
+	isTCP := proto == "tcp" || proto == "fix"
+
 	if InCluster() {
-		return fmt.Sprintf("http://%s.trading-sandbox.svc.cluster.local:8080", svc.Name), nil
+		host := fmt.Sprintf("%s.trading-sandbox.svc.cluster.local", svc.Name)
+		if isTCP {
+			return fmt.Sprintf("%s:%d", host, servicePort), nil
+		}
+		return fmt.Sprintf("http://%s:%d", host, servicePort), nil
+	}
+
+	// If the service has a LoadBalancer External IP (e.g. from minikube tunnel),
+	// use the External IP and the service port directly.
+	if len(svc.Status.LoadBalancer.Ingress) > 0 {
+		ingressIP := svc.Status.LoadBalancer.Ingress[0].IP
+		if ingressIP != "" {
+			if isTCP {
+				return fmt.Sprintf("%s:%d", ingressIP, servicePort), nil
+			}
+			return fmt.Sprintf("http://%s:%d", ingressIP, servicePort), nil
+		}
 	}
 
 	var nodePort int32
@@ -675,9 +821,36 @@ func GetSandboxTargetURL(ctx context.Context, systemName string) (string, error)
 	}
 
 	hostIP := "127.0.0.1"
-	if minikubeIP := os.Getenv("MINIKUBE_IP"); minikubeIP != "" && runtime.GOOS != "darwin" {
+	if minikubeIP := os.Getenv("MINIKUBE_IP"); minikubeIP != "" && runtime.GOOS == "linux" {
 		hostIP = minikubeIP
 	}
 
+	if isTCP {
+		return fmt.Sprintf("%s:%d", hostIP, nodePort), nil
+	}
 	return fmt.Sprintf("http://%s:%d", hostIP, nodePort), nil
+}
+
+func watchAndCleanupPod(clientset *kubernetes.Clientset, namespace string, podName string) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	// Give the pod a moment to start up
+	time.Sleep(3 * time.Second)
+
+	for range ticker.C {
+		pod, err := clientset.CoreV1().Pods(namespace).Get(context.Background(), podName, metav1.GetOptions{})
+		if err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "not found") {
+				return
+			}
+			continue
+		}
+
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			fmt.Printf("Watcher: Pod %s entered terminal phase (%s). Cleaning up service and resources...\n", podName, pod.Status.Phase)
+			_ = CleanupSandbox(podName)
+			return
+		}
+	}
 }

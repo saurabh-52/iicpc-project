@@ -10,6 +10,8 @@ import LoginPage from './pages/LoginPage';
 import RegisterPage from './pages/RegisterPage';
 import ProfilePage from './pages/ProfilePage';
 import HostDashboard from './pages/HostDashboard';
+import ContestArenaPage from './pages/ContestArenaPage';
+
 
 function Shell() {
   const location = useLocation();
@@ -17,6 +19,7 @@ function Shell() {
 
   // Don't show the shell nav on auth pages
   const isAuthPage = location.pathname === '/login' || location.pathname === '/register';
+  const isContestArena = location.pathname.startsWith('/contest/');
 
   if (isAuthPage) {
     return (
@@ -42,50 +45,60 @@ function Shell() {
 
   return (
     <div className="app-shell">
-      <header className="topbar">
-        <div className="brand-lockup">
-          <div className="brand-mark">TP</div>
-          <div>
-            <p className="eyebrow">Trading Platform</p>
-            <h1 className="brand-title">Operational control for engines and stress tests</h1>
-          </div>
-        </div>
-
-        <nav className="nav-actions" aria-label="Primary navigation">
-          <Link className={`nav-link ${location.pathname === '/' ? 'active' : ''}`} to="/">
-            Dashboard
-          </Link>
-          <Link className={`nav-link ${location.pathname === '/submit' ? 'active' : ''}`} to="/submit">
-            ⚡ Practice
-          </Link>
-          <Link className={`nav-link ${location.pathname === '/contests' ? 'active' : ''}`} to="/contests">
-            🏆 Contests
-          </Link>
-          <Link className={`nav-link ${location.pathname === '/leaderboard' ? 'active' : ''}`} to="/leaderboard">
-            Leaderboard
-          </Link>
-
-          {isAuthenticated ? (
-            <div className="nav-user-section">
-              <div className="nav-user-avatar">
-                {user?.username?.charAt(0)?.toUpperCase() || '?'}
-              </div>
-              <Link to={`/profile/${user?.username}`} className="nav-user-name" style={{ textDecoration: 'none' }}>
-                {user?.username}
-              </Link>
-              <button className="nav-logout-btn" onClick={logout} title="Sign out">
-                ↪
-              </button>
+      {!isContestArena && (
+        <header className="topbar">
+          <div className="brand-lockup">
+            <div className="brand-mark">TP</div>
+            <div>
+              <p className="eyebrow">Trading Platform</p>
+              <h1 className="brand-title">Operational control for engines and stress tests</h1>
             </div>
-          ) : (
-            <Link className="nav-link nav-login-btn" to="/login">
-              Sign in
-            </Link>
-          )}
-        </nav>
-      </header>
+          </div>
 
-      <main className="page-frame">
+          <nav className="nav-actions" aria-label="Primary navigation">
+            <Link className={`nav-link ${location.pathname === '/' ? 'active' : ''}`} to="/">
+              Dashboard
+            </Link>
+            <Link className={`nav-link ${location.pathname === '/submit' ? 'active' : ''}`} to="/submit">
+              ⚡ Practice
+            </Link>
+            <Link className={`nav-link ${location.pathname === '/contests' ? 'active' : ''}`} to="/contests">
+              🏆 Contests
+            </Link>
+            <Link className={`nav-link ${location.pathname === '/leaderboard' ? 'active' : ''}`} to="/leaderboard">
+              Leaderboard
+            </Link>
+
+            {isAuthenticated ? (
+              <div className="nav-user-section">
+                <div className="nav-user-avatar">
+                  {user?.username?.charAt(0)?.toUpperCase() || '?'}
+                </div>
+                <Link to={`/profile/${user?.username}`} className="nav-user-name" style={{ textDecoration: 'none' }}>
+                  {user?.username}
+                </Link>
+                <button
+                  type="button"
+                  className="nav-logout-btn"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    logout();
+                  }}
+                  title="Sign out"
+                >
+                  ↪
+                </button>
+              </div>
+            ) : (
+              <Link className="nav-link nav-login-btn" to="/login">
+                Sign in
+              </Link>
+            )}
+          </nav>
+        </header>
+      )}
+
+      <main className={isContestArena ? "" : "page-frame"}>
         <Routes>
           <Route path="/" element={
             <ProtectedRoute><Dashboard /></ProtectedRoute>
@@ -96,6 +109,9 @@ function Shell() {
           } />
           <Route path="/contests" element={
             <ProtectedRoute><ContestPage /></ProtectedRoute>
+          } />
+          <Route path="/contest/:id" element={
+            <ProtectedRoute><ContestArenaPage /></ProtectedRoute>
           } />
           <Route path="/profile/:username" element={
             <ProtectedRoute><ProfilePage /></ProtectedRoute>

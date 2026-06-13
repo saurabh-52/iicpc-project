@@ -59,6 +59,7 @@ const strategyLabels = {
 };
 
 function strategyLabel(strategy) {
+  if (!strategy) return 'Common';
   return strategyLabels[strategy] || strategy || '—';
 }
 
@@ -108,9 +109,9 @@ function SubmissionDetail({ submission, onClose }) {
           </div>
 
           <div className="detail-breakdown">
-            <ScoreBar label="Latency" value={submission.latency_score || 0} max={50} color="#3b82f6" />
-            <ScoreBar label="Throughput" value={submission.throughput_score || 0} max={30} color="#10b981" />
-            <ScoreBar label="Correctness" value={submission.correctness_score || 0} max={20} color="#f59e0b" />
+            <ScoreBar label="Latency" value={submission.latency_score || 0} max={25} color="#3b82f6" />
+            <ScoreBar label="Throughput" value={submission.throughput_score || 0} max={25} color="#10b981" />
+            <ScoreBar label="Correctness" value={submission.correctness_score || 0} max={50} color="#f59e0b" />
           </div>
         </div>
 
@@ -250,7 +251,7 @@ export default function SubmitPage() {
     port: '8080',
     language: 'cpp',
     protocol: 'http',
-    strategy: '', // Initialize empty, will be set when contest data loads
+    strategy: urlStrategy || 'bbo_heavy',
     rampUpSeconds: '0',
     file: null,
     contestId: urlContestId
@@ -265,6 +266,7 @@ export default function SubmitPage() {
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [selectedSubmission, setSelectedSubmission] = useState(null);
   const [contestData, setContestData] = useState(null);
+  const [activeProblemIdx, setActiveProblemIdx] = useState(0);
 
   useEffect(() => {
     if (urlContestId) {
@@ -275,6 +277,17 @@ export default function SubmitPage() {
             setContestData(data);
             if (data.details.strategy) {
               setFormData(prev => ({ ...prev, strategy: data.details.strategy }));
+            } else if (data.problems && data.problems.length > 0) {
+              let foundStrat = '';
+              for (const p of data.problems) {
+                if (p.sampleStrategies && p.sampleStrategies.length > 0) {
+                  foundStrat = p.sampleStrategies[0];
+                  break;
+                }
+              }
+              setFormData(prev => ({ ...prev, strategy: foundStrat || 'bbo_heavy' }));
+            } else {
+              setFormData(prev => ({ ...prev, strategy: 'bbo_heavy' }));
             }
           }
         })
@@ -299,6 +312,11 @@ export default function SubmitPage() {
     const end = new Date(new Date(contestData.details.startTime).getTime() + (contestData.details.durationMinutes || 60) * 60000);
     return new Date() >= end;
   }, [contestData]);
+
+  const activeProblem = useMemo(() => {
+    if (!contestData?.problems || contestData.problems.length === 0) return null;
+    return contestData.problems[activeProblemIdx] || contestData.problems[0];
+  }, [contestData, activeProblemIdx]);
 
   const getRemainingTime = () => {
     if (!contestData?.details?.startTime) return '';
@@ -334,7 +352,7 @@ export default function SubmitPage() {
     setLoadingHistory(true);
     setShowHistory(true);
     try {
-      const res = await fetch('/api/history/me?limit=20', { headers: authHeaders() });
+      const res = await fetch('/api/history/me?limit=20&judging_mode=practice', { headers: authHeaders() });
       if (!res.ok) throw new Error("Failed to fetch history");
       const data = await res.json();
       setHistory(data.history || []);
@@ -462,6 +480,7 @@ export default function SubmitPage() {
             protocol: formData.protocol,
             strategy: formData.strategy,
             system_name: formData.systemName,
+            language: formData.language,
             bots: 16,
             requests: 0,
             duration_seconds: 10,
@@ -472,6 +491,7 @@ export default function SubmitPage() {
             ramp_up_seconds: parseInt(formData.rampUpSeconds) || 0,
             judging_mode: formData.contestId ? 'contest_live' : 'practice',
             contest_id: formData.contestId || undefined,
+            filename: formData.file?.name || '',
           }),
         });
 
@@ -494,6 +514,7 @@ export default function SubmitPage() {
         setStressTestMeta({
           judgingMode: stressResult?.rounds?.[0]?.judging_mode || 'practice',
           seedUsed: stressResult?.rounds?.[0]?.seed_used || null,
+          correctnessHint: stressResult?.rounds?.[0]?.correctness_hint || null,
         });
 
         const roundCount = stressResult?.rounds?.length || 1;
@@ -607,7 +628,355 @@ export default function SubmitPage() {
         </div>
       </aside>
 
-      {(!formData.contestId || (!isContestUpcoming && !isContestEnded)) ? (
+      {formData.contestId ? (
+        contestData?.problems && contestData.problems.length > 0 ? (
+          <section className="panel form-card" style={{ maxWidth: '64rem' }}>
+            <div className="section-header" style={{ borderBottom: '1px solid rgba(148,163,184,0.12)', paddingBottom: '1rem', marginBottom: '1.5rem' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%', flexWrap: 'wrap', gap: '1rem' }}>
+                <div>
+                  <span className="section-tag">Contest Workspace</span>
+                  <h3 style={{ margin: '0.25rem 0 0 0' }}>Problems & Submissions</h3>
+                </div>
+                {/* Tabs for problems */}
+                <div className="cw-tab-group" style={{ display: 'flex', gap: '8px', background: 'rgba(15,23,42,0.03)', padding: '4px', borderRadius: '12px' }}>
+                  {contestData.problems.map((p, idx) => (
+                    <button
+                      key={p.ID}
+                      type="button"
+                      className={`cp-tab ${activeProblemIdx === idx ? 'active' : ''}`}
+                      onClick={() => setActiveProblemIdx(idx)}
+                      style={{
+                        padding: '6px 16px',
+                        borderRadius: '8px',
+                        border: 'none',
+                        cursor: 'pointer',
+                        fontSize: '0.88rem',
+                        fontWeight: '600',
+                        background: activeProblemIdx === idx ? '#fff' : 'transparent',
+                        color: activeProblemIdx === idx ? 'var(--text-h, #0f172a)' : 'var(--muted, #64748b)',
+                        boxShadow: activeProblemIdx === idx ? '0 1px 3px rgba(0,0,0,0.05)' : 'none',
+                        transition: 'all 0.2s'
+                      }}
+                    >
+                      Problem {p.Code || String.fromCharCode(65 + idx)}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1.2fr 1fr', gap: '2rem' }}>
+              {/* Left side: Selected Problem Statement */}
+              <div style={{ borderRight: '1px solid rgba(148, 163, 184, 0.12)', paddingRight: '2rem' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '0.5rem' }}>
+                  <span style={{ fontSize: '1.5rem' }}>🧩</span>
+                  <h4 style={{ margin: 0, fontSize: '1.2rem', color: 'var(--text-h)' }}>
+                    {activeProblem?.Code ? `${activeProblem.Code} — ` : ''}{activeProblem?.Title || 'Untitled Problem'}
+                  </h4>
+                </div>
+                
+                <div style={{ display: 'flex', gap: '12px', marginBottom: '1.25rem', flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: '0.82rem', background: 'rgba(99, 102, 241, 0.06)', color: '#6366f1', padding: '4px 8px', borderRadius: '6px', fontWeight: '500' }}>
+                    ⏱️ Time Limit: {activeProblem?.TimeLimit || 1}s
+                  </span>
+                  <span style={{ fontSize: '0.82rem', background: 'rgba(16, 185, 129, 0.06)', color: '#10b981', padding: '4px 8px', borderRadius: '6px', fontWeight: '500' }}>
+                    💾 Memory Limit: {activeProblem?.MemoryLimit || 256}MB
+                  </span>
+                </div>
+
+                <div style={{ 
+                  fontSize: '0.92rem', 
+                  color: 'var(--text)', 
+                  lineHeight: '1.6', 
+                  whiteSpace: 'pre-wrap', 
+                  background: 'rgba(15, 23, 42, 0.01)',
+                  border: '1px solid rgba(148, 163, 184, 0.1)',
+                  padding: '1.25rem',
+                  borderRadius: '12px',
+                  maxHeight: '380px',
+                  overflowY: 'auto',
+                  marginBottom: '1.5rem'
+                }}>
+                  {activeProblem?.Statement || 'No statement details.'}
+                </div>
+
+                {/* Strategies details */}
+                <div style={{ 
+                  background: 'rgba(37, 99, 235, 0.02)',
+                  border: '1px solid rgba(37, 99, 235, 0.1)',
+                  padding: '1rem',
+                  borderRadius: '8px',
+                  fontSize: '0.85rem'
+                }}>
+                  <h5 style={{ margin: '0 0 6px 0', color: 'var(--accent)', fontWeight: '600' }}>🎯 Baseline Testing Profile</h5>
+                  <p style={{ margin: 0, color: 'var(--text-muted)' }}>
+                    This problem runs with baseline strategies: <strong>{[...(activeProblem?.SampleStrategies || []).map(s => s.replace(/_/g, ' ')), ...(activeProblem?.SampleBotFilesJSON ? JSON.parse(activeProblem.SampleBotFilesJSON).map(f => f.name) : [])].join(', ') || 'None'}</strong>.
+                  </p>
+                </div>
+              </div>
+
+              {/* Right side: Submission form */}
+              <div>
+                {isContestUpcoming ? (
+                  <div style={{ padding: '2.5rem 1rem', textAlign: 'center', background: 'rgba(15, 23, 42, 0.02)', borderRadius: '1rem', border: '1px dashed rgba(148, 163, 184, 0.25)' }}>
+                    <span style={{ fontSize: '2.5rem', display: 'block', marginBottom: '12px' }}>🔒</span>
+                    <h4 style={{ margin: '0 0 8px 0', color: 'var(--text-h)' }}>Submission Locked</h4>
+                    <p style={{ margin: 0, fontSize: '0.88rem', color: 'var(--muted)' }}>
+                      The contest has not started yet. Submissions will open automatically when the countdown reaches zero.
+                    </p>
+                  </div>
+                ) : isContestEnded ? (
+                  <div style={{ padding: '2.5rem 1rem', textAlign: 'center', background: 'rgba(239, 68, 68, 0.02)', borderRadius: '1rem', border: '1px dashed rgba(239, 68, 68, 0.25)' }}>
+                    <span style={{ fontSize: '2.5rem', display: 'block', marginBottom: '12px' }}>🏁</span>
+                    <h4 style={{ margin: '0 0 8px 0', color: '#ef4444' }}>Contest Ended</h4>
+                    <p style={{ margin: 0, fontSize: '0.88rem', color: 'var(--muted)' }}>
+                      This contest has closed. Submissions are locked and final scores are being computed.
+                    </p>
+                  </div>
+                ) : (
+                  <form onSubmit={handleSubmit} className="submit-form">
+                    {/* Submission fields */}
+                    <div className="field-grid" style={{ gridTemplateColumns: '1fr', gap: '1rem' }}>
+                      <label className="field">
+                        <span>Exposed Port</span>
+                        <input required type="number" name="port" value={formData.port} onChange={handleChange} />
+                      </label>
+
+                      <label className="field">
+                        <span>Language</span>
+                        <select name="language" value={formData.language} onChange={handleChange}>
+                          <option value="cpp">C++</option>
+                          <option value="go">Go</option>
+                          <option value="rust">Rust</option>
+                          <option value="python">Python</option>
+                        </select>
+                      </label>
+
+                      <label className="field">
+                        <span>Protocol</span>
+                        <select name="protocol" value={formData.protocol} onChange={handleChange}>
+                          <option value="http">HTTP / REST</option>
+                          <option value="tcp">Raw TCP</option>
+                          <option value="fix">FIX Protocol</option>
+                        </select>
+                      </label>
+                    </div>
+
+                    <div style={{
+                      marginTop: '0.5rem',
+                      marginBottom: '1rem',
+                      padding: '0.65rem 0.85rem',
+                      background: 'rgba(99, 102, 241, 0.05)',
+                      borderLeft: '3px solid #6366f1',
+                      borderRadius: '0.5rem',
+                      fontSize: '0.78rem',
+                      color: '#4f46e5',
+                      lineHeight: '1.4'
+                    }}>
+                      <span>ℹ️ <strong>Contest Mode:</strong> Bots fire using <strong>80% fixed and 20% random (time-based) seeds</strong> to simulate live market fluctuations.</span>
+                    </div>
+
+                    <div className="field-grid" style={{ gridTemplateColumns: '1fr' }}>
+                      <label className="field">
+                        <span>Ramp-Up (seconds)</span>
+                        <input type="number" name="rampUpSeconds" value={formData.rampUpSeconds} min="0" max="30" onChange={handleChange} />
+                      </label>
+                    </div>
+
+                    <label className="field upload-field">
+                      <span>Source Code</span>
+                      <input required type="file" name="file" accept=".cpp,.cc,.cxx,.rs,.go,.py" onChange={handleChange} />
+                    </label>
+
+                    {submitState.message ? (
+                      <div className={`feedback ${submitState.type}`} style={{ marginBottom: '1rem' }}>{submitState.message}</div>
+                    ) : null}
+
+                    <div style={{ display: 'flex', gap: '1rem', marginTop: '1.5rem', flexWrap: 'wrap' }}>
+                      <button type="submit" className="button button-primary submit-button" disabled={isSubmitting} style={{ flex: 2 }}>
+                        {isSubmitting ? 'Submitting...' : 'Submit Trading System →'}
+                      </button>
+                      <button type="button" className="button button-secondary submit-button" disabled={loadingHistory} onClick={fetchHistory} style={{ flex: 1, padding: '1rem 0' }}>
+                        {loadingHistory ? 'Loading...' : 'View History'}
+                      </button>
+                    </div>
+                  </form>
+                )}
+
+                {/* Execution outcome display */}
+                {executionResult && (
+                  <section className="result-panel" style={{ marginTop: '1.5rem', padding: '1rem', borderRadius: '8px', background: 'rgba(15, 23, 42, 0.02)', border: '1px solid rgba(148, 163, 184, 0.15)' }}>
+                    <div className="result-row">
+                      <span>Pod ID</span>
+                      <strong>{executionResult.pod_id}</strong>
+                    </div>
+                    <div className="result-row">
+                      <span>Service</span>
+                      <strong>{executionResult.service_name}</strong>
+                    </div>
+                    <div className="result-row">
+                      <span>Phase</span>
+                      <strong>{executionResult.phase}</strong>
+                    </div>
+                    {executionResult.node_port && (
+                      <div className="result-row">
+                        <span>NodePort</span>
+                        <strong>{executionResult.node_port}</strong>
+                      </div>
+                    )}
+                    {executionResult.target_url && (
+                      <div className="result-row">
+                        <span>Target</span>
+                        <strong>{executionResult.target_url}</strong>
+                      </div>
+                    )}
+                    {executionResult.output && (
+                      <div className="result-output" style={{ marginTop: '0.5rem', maxHeight: '150px', overflowY: 'auto', fontSize: '0.78rem', background: '#0f172a', color: '#cbd5e1', padding: '8px', borderRadius: '4px', fontFamily: 'monospace' }}>
+                        <span>Execution Output / Logs</span>
+                        <pre style={{ margin: '4px 0 0 0', whiteSpace: 'pre-wrap' }}>{executionResult.output}</pre>
+                      </div>
+                    )}
+                    <button
+                      type="button"
+                      className="button button-secondary"
+                      style={{ marginTop: '0.5rem', fontSize: '0.85rem', padding: '0.6rem 1rem' }}
+                      onClick={handleCleanup}
+                    >
+                      🗑️ Cleanup sandbox
+                    </button>
+                  </section>
+                )}
+
+                {stressTestResult && (
+                  <section className="result-panel" style={{ marginTop: '1.5rem' }}>
+                    {stressTestMeta ? (
+                      <div style={{
+                        display: 'flex',
+                        gap: '0.5rem',
+                        marginBottom: '0.75rem',
+                        flexWrap: 'wrap',
+                      }}>
+                        <span style={{
+                          background: 'rgba(99, 102, 241, 0.15)',
+                          color: 'var(--accent)',
+                          padding: '0.25rem 0.6rem',
+                          borderRadius: '6px',
+                          fontSize: '0.75rem',
+                          fontWeight: 600,
+                          textTransform: 'uppercase',
+                          letterSpacing: '0.5px',
+                        }}>
+                          ⚡ {stressTestMeta.judgingMode === 'practice' ? 'Practice' : stressTestMeta.judgingMode}
+                        </span>
+                        {stressTestMeta.seedUsed != null ? (
+                          <span style={{
+                            background: 'rgba(255, 255, 255, 0.05)',
+                            color: 'var(--muted)',
+                            padding: '0.25rem 0.6rem',
+                            borderRadius: '6px',
+                            fontSize: '0.75rem',
+                            fontFamily: 'monospace',
+                          }}>
+                            seed: 0x{stressTestMeta.seedUsed.toString(16)}
+                          </span>
+                        ) : null}
+                      </div>
+                    ) : null}
+                    <div className="result-row">
+                      <span>Strategy</span>
+                      <strong>{stressTestResult.strategy}</strong>
+                    </div>
+                    <div className="result-row">
+                      <span>Target</span>
+                      <strong>{stressTestResult.target}</strong>
+                    </div>
+                    <div className="result-row">
+                      <span>Requests</span>
+                      <strong>{stressTestResult.requests}</strong>
+                    </div>
+                    <div className="result-row">
+                      <span>Successes</span>
+                      <strong>{stressTestResult.successes}</strong>
+                    </div>
+                    <div className="result-row">
+                      <span>Failures</span>
+                      <strong>{stressTestResult.failures}</strong>
+                    </div>
+                    <div className="result-row">
+                      <span>TPS</span>
+                      <strong>
+                        {stressTestResult.requests_per_second != null
+                          ? stressTestResult.requests_per_second.toFixed(1)
+                          : '—'}
+                      </strong>
+                    </div>
+                    <div className="result-output">
+                      <span>Latency summary</span>
+                      <pre>
+                        {stressTestResult.min_latency_ms != null
+                          ? `min: ${stressTestResult.min_latency_ms.toFixed(2)}ms\n`
+                          : ''}
+                        {stressTestResult.avg_latency_ms != null
+                          ? `avg: ${stressTestResult.avg_latency_ms.toFixed(2)}ms\n`
+                          : ''}
+                        {stressTestResult.p50_latency_ms != null
+                          ? `p50: ${stressTestResult.p50_latency_ms.toFixed(2)}ms\n`
+                          : ''}
+                        {stressTestResult.p90_latency_ms != null
+                          ? `p90: ${stressTestResult.p90_latency_ms.toFixed(2)}ms\n`
+                          : ''}
+                        {stressTestResult.p99_latency_ms != null
+                          ? `p99: ${stressTestResult.p99_latency_ms.toFixed(2)}ms\n`
+                          : ''}
+                        {stressTestResult.max_latency_ms != null
+                          ? `max: ${stressTestResult.max_latency_ms.toFixed(2)}ms\n`
+                          : ''}
+                        {stressTestResult.stddev_latency_ms != null
+                          ? `σ:   ${stressTestResult.stddev_latency_ms.toFixed(2)}ms`
+                          : ''}
+                      </pre>
+                    </div>
+
+                    {stressTestResult.error_breakdown && Object.keys(stressTestResult.error_breakdown).length > 0 ? (
+                      <div className="result-output">
+                        <span>Error breakdown</span>
+                        <pre>
+                          {Object.entries(stressTestResult.error_breakdown)
+                            .map(([kind, count]) => `${kind}: ${count}`)
+                            .join('\n')}
+                        </pre>
+                      </div>
+                    ) : null}
+
+                    {stressTestMeta?.correctnessHint ? (
+                      <div style={{
+                        background: 'rgba(245, 158, 11, 0.1)',
+                        border: '1px solid rgba(245, 158, 11, 0.3)',
+                        borderRadius: '8px',
+                        padding: '0.75rem 1rem',
+                        marginTop: '0.75rem',
+                        fontSize: '0.85rem',
+                        lineHeight: '1.5',
+                        color: '#fbbf24',
+                      }}>
+                        <strong style={{ display: 'block', marginBottom: '0.25rem' }}>⚠️ Correctness Hint</strong>
+                        {stressTestMeta.correctnessHint}
+                      </div>
+                    ) : null}
+                  </section>
+                )}
+              </div>
+            </div>
+          </section>
+        ) : (
+          <section className="panel form-card" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '300px' }}>
+            <div style={{ textAlign: 'center', color: 'var(--muted)' }}>
+              <span style={{ fontSize: '2rem' }}>🔄</span>
+              <p>Loading contest details and problems...</p>
+            </div>
+          </section>
+        )
+      ) : (
         <section className="panel form-card">
           <div className="section-header">
             <div>
@@ -645,36 +1014,54 @@ export default function SubmitPage() {
 
             <label className="field">
               <span>Stress Test Strategy</span>
-              {formData.contestId ? (
-                <div style={{ padding: '0.95rem 1rem', background: 'rgba(241, 245, 249, 0.5)', borderRadius: '1rem', border: '1px solid rgba(148, 163, 184, 0.35)', color: '#475569', fontWeight: '500' }}>
-                  {contestData?.details?.strategy 
-                    ? contestData.details.strategy.split(',').filter(Boolean).map(s => strategyLabel(s)).join(', ') 
-                    : strategyLabel(formData.strategy)}
-                  <span style={{ display: 'block', fontSize: '0.75rem', color: '#6366f1', marginTop: '0.25rem', fontWeight: '600' }}>(Configured by Host)</span>
-                </div>
-              ) : (
-                <select
-                  name="strategy"
-                  value={formData.strategy}
-                  onChange={handleChange}
-                  disabled={isSubmitting}
-                >
-                  <option value="bbo_heavy">BBO Heavy (Common)</option>
-                  <option value="flash_crash">Flash Crash</option>
-                  <option value="high_cancel">High Cancel Rate</option>
-                  <option value="wide_spread">Wide Spread</option>
-                  <option value="market_maker">Market Maker</option>
-                  <option value="iceberg">Iceberg Orders</option>
-                  <option value="momentum_burst">Momentum Burst</option>
-                </select>
-              )}
+              <select
+                name="strategy"
+                value={formData.strategy}
+                onChange={handleChange}
+                disabled={isSubmitting}
+              >
+                <option value="bbo_heavy">BBO Heavy (Common)</option>
+                <option value="flash_crash">Flash Crash</option>
+                <option value="high_cancel">High Cancel Rate</option>
+                <option value="wide_spread">Wide Spread</option>
+                <option value="market_maker">Market Maker</option>
+                <option value="iceberg">Iceberg Orders</option>
+                <option value="momentum_burst">Momentum Burst</option>
+              </select>
             </label>
 
-            <div className="field-grid">
+            <div style={{
+              marginTop: '-0.5rem',
+              marginBottom: '1rem',
+              padding: '0.65rem 0.85rem',
+              background: 'rgba(99, 102, 241, 0.05)',
+              borderLeft: '3px solid #6366f1',
+              borderRadius: '0.5rem',
+              fontSize: '0.78rem',
+              color: '#4f46e5',
+              lineHeight: '1.4'
+            }}>
+              <span>ℹ️ <strong>Practice Mode:</strong> Bots fire using <strong>100% fixed, deterministic seeds</strong> for fully reproducible test runs.</span>
+            </div>
+
+            <div className="field-grid" style={{ alignItems: 'center' }}>
               <label className="field">
                 <span>Ramp-Up (seconds)</span>
                 <input type="number" name="rampUpSeconds" value={formData.rampUpSeconds} min="0" max="30" onChange={handleChange} />
               </label>
+
+              <div style={{
+                gridColumn: 'span 2',
+                padding: '0.65rem 0.85rem',
+                background: 'rgba(245, 158, 11, 0.05)',
+                borderLeft: '3px solid #f59e0b',
+                borderRadius: '0.5rem',
+                fontSize: '0.78rem',
+                color: '#d97706',
+                lineHeight: '1.4'
+              }}>
+                <span>⚠️ <strong>Caution:</strong> Your engine responses should include <code>best_bid</code> and <code>best_ask</code> fields. To receive a correctness score, your engine must return JSON like: <code>{'{"status":"accepted","best_bid":99.95,"best_ask":100.05}'}</code> so the validator can verify your orderbook state after each order.</span>
+              </div>
             </div>
 
             <label className="field upload-field">
@@ -748,7 +1135,7 @@ export default function SubmitPage() {
                       textTransform: 'uppercase',
                       letterSpacing: '0.5px',
                     }}>
-                      ⚡ {stressTestMeta.judgingMode === 'practice' ? 'Practice' : stressTestMeta.judgingMode}
+                      ⚡ Practice
                     </span>
                     {stressTestMeta.seedUsed != null ? (
                       <span style={{
@@ -829,6 +1216,22 @@ export default function SubmitPage() {
                     </pre>
                   </div>
                 ) : null}
+
+                {stressTestMeta?.correctnessHint ? (
+                  <div style={{
+                    background: 'rgba(245, 158, 11, 0.1)',
+                    border: '1px solid rgba(245, 158, 11, 0.3)',
+                    borderRadius: '8px',
+                    padding: '0.75rem 1rem',
+                    marginTop: '0.75rem',
+                    fontSize: '0.85rem',
+                    lineHeight: '1.5',
+                    color: '#fbbf24',
+                  }}>
+                    <strong style={{ display: 'block', marginBottom: '0.25rem' }}>⚠️ Correctness Hint</strong>
+                    {stressTestMeta.correctnessHint}
+                  </div>
+                ) : null}
               </section>
             ) : null}
 
@@ -841,37 +1244,6 @@ export default function SubmitPage() {
               </button>
             </div>
           </form>
-        </section>
-      ) : (
-        <section className="panel form-card" style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center', textAlign: 'center', padding: '4rem 2rem' }}>
-          {isContestUpcoming ? (
-            <>
-              <div style={{ fontSize: '4rem', marginBottom: '1rem' }}>⏳</div>
-              <h2 style={{ color: 'var(--text-h)', marginBottom: '1rem', fontSize: '2rem' }}>Contest starting soon!</h2>
-              <p style={{ color: 'var(--text-muted)', maxWidth: '400px', margin: '0 auto 2rem', fontSize: '1.1rem', lineHeight: '1.6' }}>
-                Review the task description on the left and prepare your trading engine. Submissions will open automatically when the countdown reaches zero.
-              </p>
-              <button className="button button-secondary" onClick={fetchHistory} disabled={loadingHistory} style={{ padding: '0.75rem 2rem' }}>
-                {loadingHistory ? 'Loading...' : 'View My History'}
-              </button>
-            </>
-          ) : (
-            <>
-              <div style={{ fontSize: '4rem', marginBottom: '1rem' }}>🏁</div>
-              <h2 style={{ color: 'var(--text-h)', marginBottom: '1rem', fontSize: '2rem' }}>Contest has ended!</h2>
-              <p style={{ color: 'var(--text-muted)', maxWidth: '400px', margin: '0 auto 2rem', fontSize: '1.1rem', lineHeight: '1.6' }}>
-                Submissions are no longer accepted. Final evaluations are running on the latest submissions.
-              </p>
-              <div style={{ display: 'flex', gap: '1rem', justifyContent: 'center' }}>
-                <Link className="button button-primary" style={{ padding: '0.75rem 2rem' }} to={`/leaderboard?contest_id=${formData.contestId}`}>
-                  View Leaderboard
-                </Link>
-                <button className="button button-secondary" style={{ padding: '0.75rem 2rem' }} onClick={fetchHistory} disabled={loadingHistory}>
-                  {loadingHistory ? 'Loading...' : 'View My History'}
-                </button>
-              </div>
-            </>
-          )}
         </section>
       )}
 

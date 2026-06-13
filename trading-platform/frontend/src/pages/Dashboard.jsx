@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { Link } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 
@@ -97,6 +97,249 @@ function SubmissionChart({ entries }) {
   );
 }
 
+const gradeColors = {
+  S: { bg: 'linear-gradient(135deg, #fbbf24, #f59e0b)', color: '#78350f', glow: 'rgba(251,191,36,0.3)' },
+  A: { bg: 'linear-gradient(135deg, #34d399, #10b981)', color: '#064e3b', glow: 'rgba(52,211,153,0.3)' },
+  B: { bg: 'linear-gradient(135deg, #60a5fa, #3b82f6)', color: '#1e3a5f', glow: 'rgba(96,165,250,0.3)' },
+  C: { bg: 'linear-gradient(135deg, #a78bfa, #8b5cf6)', color: '#2e1065', glow: 'rgba(167,139,250,0.3)' },
+  F: { bg: 'linear-gradient(135deg, #f87171, #ef4444)', color: '#7f1d1d', glow: 'rgba(248,113,113,0.3)' },
+};
+
+function GradeBadge({ grade }) {
+  const style = gradeColors[grade] || gradeColors.F;
+  return (
+    <span
+      className="grade-badge"
+      style={{
+        background: style.bg,
+        color: style.color,
+        boxShadow: `0 4px 16px ${style.glow}`,
+        padding: '0.2rem 0.6rem',
+        borderRadius: '0.5rem',
+        fontWeight: '800',
+        fontSize: '0.8rem',
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        minWidth: '1.6rem',
+        height: '1.6rem',
+      }}
+    >
+      {grade}
+    </span>
+  );
+}
+
+function ScoreBar({ label, value, max, color }) {
+  const pct = Math.min((value / max) * 100, 100);
+  return (
+    <div className="score-bar-container">
+      <div className="score-bar-label">
+        <span>{label}</span>
+        <span>{value?.toFixed(1)}/{max}</span>
+      </div>
+      <div className="score-bar-track">
+        <div
+          className="score-bar-fill"
+          style={{ width: `${pct}%`, background: color }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function formatLatency(ms) {
+  if (ms == null) return '—';
+  if (ms < 1) return `${(ms * 1000).toFixed(0)}µs`;
+  if (ms < 100) return `${ms.toFixed(2)}ms`;
+  return `${ms.toFixed(0)}ms`;
+}
+
+function formatTPS(tps) {
+  if (tps == null) return '—';
+  if (tps >= 1000) return `${(tps / 1000).toFixed(1)}K`;
+  return tps.toFixed(0);
+}
+
+const strategyLabels = {
+  bbo_heavy: 'Common',
+  flash_crash: 'Flash Crash',
+  high_cancel: 'High Cancel',
+  wide_spread: 'Wide Spread',
+  market_maker: 'Market Maker',
+  iceberg: 'Iceberg',
+  momentum_burst: 'Momentum Burst',
+};
+
+function strategyLabel(strategy) {
+  if (!strategy) return 'Common';
+  return strategyLabels[strategy] || strategy || '—';
+}
+
+function SubmissionDetail({ submission, onClose }) {
+  if (!submission) return null;
+
+  const [activeTab, setActiveTab] = useState('average');
+
+  const rawMetricsObj = useMemo(() => {
+    if (!submission.raw_metrics) return null;
+    try {
+      if (typeof submission.raw_metrics === 'string') {
+        return JSON.parse(submission.raw_metrics);
+      }
+      return submission.raw_metrics;
+    } catch {
+      return null;
+    }
+  }, [submission.raw_metrics]);
+
+  const isMulti = rawMetricsObj?.is_multi_strategy;
+  const rounds = rawMetricsObj?.rounds || [];
+
+  const displaySource = useMemo(() => {
+    if (activeTab === 'average' || !isMulti) {
+      return {
+        strategy: submission.strategy,
+        grade: submission.grade,
+        total_score: submission.total_score,
+        latency_score: submission.latency_score,
+        throughput_score: submission.throughput_score,
+        correctness_score: submission.correctness_score,
+        p99_latency_ms: submission.p99_latency_ms,
+        tps: submission.tps,
+        orders_processed: submission.orders_processed,
+        cross_events: submission.cross_events,
+      };
+    }
+    const r = rounds[activeTab];
+    return {
+      strategy: r?.strategy,
+      grade: r?.score?.grade || 'F',
+      total_score: r?.score?.total_score || 0,
+      latency_score: r?.score?.latency_score || 0,
+      throughput_score: r?.score?.throughput_score || 0,
+      correctness_score: r?.score?.correctness_score || 0,
+      p99_latency_ms: r?.perf_metrics?.p99_latency_ms || r?.metrics?.p99_latency_ms || 0,
+      tps: r?.perf_metrics?.tps || r?.metrics?.requests_per_second || 0,
+      orders_processed: r?.val_result?.orders_processed || r?.metrics?.successes || 0,
+      cross_events: r?.val_result?.cross_events || 0,
+    };
+  }, [activeTab, submission, rounds, isMulti]);
+
+  const displayName = (entry) => {
+    if (entry.system_name && entry.system_name.trim()) return entry.system_name;
+    return entry.submission_id?.slice(0, 18) || '—';
+  };
+
+  return (
+    <div className="detail-overlay" onClick={onClose} style={{
+      position: 'fixed', inset: 0, zIndex: 1000,
+      background: 'rgba(15, 23, 42, 0.4)', backdropFilter: 'blur(4px)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '1rem'
+    }}>
+      <article className="detail-card panel" onClick={e => e.stopPropagation()} style={{
+        background: '#fff', padding: '2rem', borderRadius: '16px', maxWidth: '36rem', width: '100%',
+        boxShadow: 'var(--shadow)', border: '1px solid rgba(148, 163, 184, 0.2)'
+      }}>
+        <div className="detail-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '1.25rem' }}>
+          <div>
+            <span className="section-tag" style={{ fontSize: '0.7rem', color: 'var(--muted)', display: 'block', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Submission Detail</span>
+            <h3 style={{ margin: '0.25rem 0 0 0', fontSize: '1.35rem', color: 'var(--text-h)' }}>{displayName(submission)}</h3>
+            <span className="detail-strategy-tag" style={{ display: 'inline-block', fontSize: '0.78rem', background: 'rgba(99,102,241,0.08)', color: '#6366f1', padding: '2px 8px', borderRadius: '6px', marginTop: '0.5rem', fontWeight: 600 }}>
+              {strategyLabel(displaySource.strategy)}
+            </span>
+          </div>
+          <button className="detail-close" onClick={onClose} aria-label="Close" style={{ background: 'none', border: 'none', fontSize: '1.25rem', cursor: 'pointer', color: 'var(--text)' }}>✕</button>
+        </div>
+
+        {isMulti && (
+          <div className="multi-strategy-tabs" style={{ display: 'flex', gap: '0.35rem', marginBottom: '1.25rem', overflowX: 'auto', paddingBottom: '6px', borderBottom: '1px solid rgba(148, 163, 184, 0.12)' }}>
+            <button
+              onClick={() => setActiveTab('average')}
+              style={{
+                padding: '6px 12px',
+                borderRadius: '6px',
+                border: 'none',
+                cursor: 'pointer',
+                fontSize: '0.78rem',
+                fontWeight: '600',
+                background: activeTab === 'average' ? 'linear-gradient(135deg, #6366f1 0%, #4f46e5 100%)' : 'rgba(15,23,42,0.03)',
+                color: activeTab === 'average' ? '#fff' : 'var(--text-h)',
+                transition: 'all 0.2s',
+                boxShadow: activeTab === 'average' ? '0 2px 6px rgba(99, 102, 241, 0.2)' : 'none',
+              }}
+            >
+              Summary (Average)
+            </button>
+            {rounds.map((round, idx) => (
+              <button
+                key={idx}
+                onClick={() => setActiveTab(idx)}
+                style={{
+                  padding: '6px 12px',
+                  borderRadius: '6px',
+                  border: 'none',
+                  cursor: 'pointer',
+                  fontSize: '0.78rem',
+                  fontWeight: '600',
+                  background: activeTab === idx ? 'linear-gradient(135deg, #6366f1 0%, #4f46e5 100%)' : 'rgba(15,23,42,0.03)',
+                  color: activeTab === idx ? '#fff' : 'var(--text-h)',
+                  transition: 'all 0.2s',
+                  boxShadow: activeTab === idx ? '0 2px 6px rgba(99, 102, 241, 0.2)' : 'none',
+                  whiteSpace: 'nowrap'
+                }}
+              >
+                {strategyLabel(round.strategy)}
+              </button>
+            ))}
+          </div>
+        )}
+
+        <div className="detail-scores" style={{ display: 'flex', gap: '2rem', alignItems: 'center', marginBottom: '1.5rem', padding: '1rem', background: 'rgba(15,23,42,0.02)', borderRadius: '12px' }}>
+          <div className="detail-total" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.5rem', borderRight: '1px solid rgba(148,163,184,0.15)', paddingRight: '1.5rem' }}>
+            <GradeBadge grade={displaySource.grade} />
+            <div className="detail-total-num" style={{ fontSize: '1.5rem', color: 'var(--text-h)', fontWeight: '800' }}>
+              <strong>{displaySource.total_score?.toFixed(1) || '0.0'}</strong>
+              <span style={{ fontSize: '0.9rem', color: 'var(--muted)', fontWeight: '400' }}>/100</span>
+            </div>
+          </div>
+
+          <div className="detail-breakdown" style={{ flex: 1 }}>
+            <ScoreBar label="Latency" value={displaySource.latency_score || 0} max={25} color="#3b82f6" />
+            <ScoreBar label="Throughput" value={displaySource.throughput_score || 0} max={25} color="#10b981" />
+            <ScoreBar label="Correctness" value={displaySource.correctness_score || 0} max={50} color="#f59e0b" />
+          </div>
+        </div>
+
+        <div className="detail-metrics" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem', background: 'rgba(15,23,42,0.01)', border: '1px solid rgba(148, 163, 184, 0.1)', padding: '1rem', borderRadius: '12px' }}>
+          <div style={{ display: 'flex', flexDirection: 'column' }}>
+            <span style={{ fontSize: '0.75rem', color: 'var(--muted)' }}>P99 Latency</span>
+            <strong style={{ fontSize: '0.95rem', color: 'var(--text-h)' }}>{formatLatency(displaySource.p99_latency_ms)}</strong>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column' }}>
+            <span style={{ fontSize: '0.75rem', color: 'var(--muted)' }}>TPS</span>
+            <strong style={{ fontSize: '0.95rem', color: 'var(--text-h)' }}>{formatTPS(displaySource.tps)}</strong>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column' }}>
+            <span style={{ fontSize: '0.75rem', color: 'var(--muted)' }}>Orders</span>
+            <strong style={{ fontSize: '0.95rem', color: 'var(--text-h)' }}>{(displaySource.orders_processed || 0).toLocaleString()}</strong>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column' }}>
+            <span style={{ fontSize: '0.75rem', color: 'var(--muted)' }}>Crosses</span>
+            <strong style={{ fontSize: '0.95rem', color: displaySource.cross_events > 0 ? '#ef4444' : 'var(--text-h)' }}>
+              {displaySource.cross_events || 0}
+            </strong>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column' }}>
+            <span style={{ fontSize: '0.75rem', color: 'var(--muted)' }}>Submitted</span>
+            <strong style={{ fontSize: '0.82rem', color: 'var(--text-h)' }}>{new Date(submission.submitted_at).toLocaleString()}</strong>
+          </div>
+        </div>
+      </article>
+    </div>
+  );
+}
+
 export default function Dashboard() {
   const { user, authHeaders } = useAuth();
   const [stats, setStats] = useState({
@@ -109,6 +352,7 @@ export default function Dashboard() {
   const [topEntries, setTopEntries] = useState([]);
   const [myHistory, setMyHistory] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [selectedSubmission, setSelectedSubmission] = useState(null);
 
   useEffect(() => {
     // Fetch global leaderboard for stats
@@ -372,7 +616,13 @@ export default function Dashboard() {
               <span>Submitted</span>
             </div>
             {myHistory.slice(0, 10).map((entry) => (
-              <div key={entry.submission_id} className="db-table-row">
+              <div
+                key={entry.submission_id}
+                className="db-table-row"
+                style={{ cursor: 'pointer' }}
+                onClick={() => setSelectedSubmission(entry)}
+                title="Click to view details"
+              >
                 <div>
                   <span style={{
                     display: 'inline-flex',
@@ -390,7 +640,7 @@ export default function Dashboard() {
                   </span>
                 </div>
                 <div style={{ fontSize: '0.88rem', color: '#0f172a', fontWeight: '500' }}>
-                  {entry.strategy}
+                  {strategyLabel(entry.strategy)}
                 </div>
                 <div style={{ fontFamily: 'var(--mono)', fontSize: '0.88rem', fontWeight: '600' }}>
                   {entry.total_score?.toFixed(1)}
@@ -409,6 +659,13 @@ export default function Dashboard() {
           </div>
         )}
       </section>
+
+      {selectedSubmission && (
+        <SubmissionDetail
+          submission={selectedSubmission}
+          onClose={() => setSelectedSubmission(null)}
+        />
+      )}
     </div>
   );
 }

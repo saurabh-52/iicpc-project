@@ -18,14 +18,54 @@ type Orderbook struct {
 }
 
 // AddOrder inserts or increases quantity at the given price level on the
-// appropriate side.  side must be "BUY" or "SELL".
+// appropriate side, simulating order matching if the spread is crossed.
+// side must be "BUY" or "SELL".
 func (ob *Orderbook) AddOrder(side string, price float64, qty int) {
+	qtyRemaining := qty
 	if side == "BUY" {
-		ob.Bids = upsertLevel(ob.Bids, price, qty)
-		sort.Slice(ob.Bids, func(i, j int) bool { return ob.Bids[i].Price > ob.Bids[j].Price })
+		// Match against asks: lowest ask price first (ob.Asks is sorted ascending)
+		for len(ob.Asks) > 0 && qtyRemaining > 0 {
+			bestAsk := &ob.Asks[0]
+			if price < bestAsk.Price {
+				break // Spread not crossed
+			}
+			matchQty := qtyRemaining
+			if bestAsk.TotalQty < matchQty {
+				matchQty = bestAsk.TotalQty
+			}
+			qtyRemaining -= matchQty
+			bestAsk.TotalQty -= matchQty
+			if bestAsk.TotalQty <= 0 {
+				ob.Asks = ob.Asks[1:]
+			}
+		}
+		// Insert remaining quantity if any
+		if qtyRemaining > 0 {
+			ob.Bids = upsertLevel(ob.Bids, price, qtyRemaining)
+			sort.Slice(ob.Bids, func(i, j int) bool { return ob.Bids[i].Price > ob.Bids[j].Price })
+		}
 	} else {
-		ob.Asks = upsertLevel(ob.Asks, price, qty)
-		sort.Slice(ob.Asks, func(i, j int) bool { return ob.Asks[i].Price < ob.Asks[j].Price })
+		// Match against bids: highest bid price first (ob.Bids is sorted descending)
+		for len(ob.Bids) > 0 && qtyRemaining > 0 {
+			bestBid := &ob.Bids[0]
+			if price > bestBid.Price {
+				break // Spread not crossed
+			}
+			matchQty := qtyRemaining
+			if bestBid.TotalQty < matchQty {
+				matchQty = bestBid.TotalQty
+			}
+			qtyRemaining -= matchQty
+			bestBid.TotalQty -= matchQty
+			if bestBid.TotalQty <= 0 {
+				ob.Bids = ob.Bids[1:]
+			}
+		}
+		// Insert remaining quantity if any
+		if qtyRemaining > 0 {
+			ob.Asks = upsertLevel(ob.Asks, price, qtyRemaining)
+			sort.Slice(ob.Asks, func(i, j int) bool { return ob.Asks[i].Price < ob.Asks[j].Price })
+		}
 	}
 }
 
@@ -53,6 +93,13 @@ func (ob *Orderbook) BestAsk() (float64, bool) {
 		return 0, false
 	}
 	return ob.Asks[0].Price, true
+}
+
+// BBO returns the current best-bid and best-ask in one call.
+func (ob *Orderbook) BBO() (bestBid float64, hasBid bool, bestAsk float64, hasAsk bool) {
+	bestBid, hasBid = ob.BestBid()
+	bestAsk, hasAsk = ob.BestAsk()
+	return
 }
 
 // ValidateCross returns an error if the book is crossed (best bid >= best ask),

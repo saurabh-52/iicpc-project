@@ -3452,3 +3452,28 @@ select:focus-visible {
   opacity: 1;
 }
 
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+
+.cw-input:disabled,
+.cw-select:disabled,
+.cw-textarea:disabled {
+  background: rgba(148, 163, 184, 0.08) !important;
+  color: #64748b !important;
+  border-color: rgba(148, 163, 184, 0.18) !important;
+  cursor: not-allowed !important;
+}
+
+.cw-chip.disabled {
+  opacity: 0.5;
+  cursor: not-allowed !important;
+  pointer-events: none;
+}
+.cw-chip.disabled:hover {
+  background: rgba(255, 255, 255, 0.8) !important;
+  border-color: rgba(148, 163, 184, 0.2) !important;
+}
+
+
