@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Saurabh-52/trading-platform/internal/scorer"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -215,6 +216,10 @@ ON CONFLICT (submission_id) DO UPDATE SET
 	return err
 }
 
+func normalizeSubmissionGrade(r *SubmissionResult) {
+	r.Grade = scorer.AssignGrade(r.TotalScore)
+}
+
 // GetLeaderboard returns the top-N practice submissions ordered by total_score DESC.
 // Only 'practice' mode runs are eligible for the global public leaderboard —
 // contest_live, contest_final, and demo runs are excluded to prevent strategy leakage.
@@ -277,6 +282,7 @@ LIMIT $2
 		); err != nil {
 			return nil, err
 		}
+		normalizeSubmissionGrade(&r)
 		results = append(results, r)
 	}
 	return results, rows.Err()
@@ -304,6 +310,7 @@ func (s *Store) scanLeaderboard(ctx context.Context, query string, limit int) ([
 		); err != nil {
 			return nil, err
 		}
+		normalizeSubmissionGrade(&r)
 		results = append(results, r)
 	}
 	return results, rows.Err()
@@ -340,6 +347,7 @@ LIMIT $2
 		); err != nil {
 			return nil, err
 		}
+		normalizeSubmissionGrade(&r)
 		results = append(results, r)
 	}
 	return results, rows.Err()
@@ -364,6 +372,7 @@ WHERE submission_id = $1
 		&r.RawMetrics, &r.RawValidation,
 		&r.JudgingMode, &r.ContestID, &r.FinalRound, &r.SeedUsed, &r.ProblemID, &r.Filename,
 	)
+	normalizeSubmissionGrade(&r)
 	return r, err
 }
 
@@ -729,18 +738,7 @@ ORDER BY COALESCE(u.username, sr.system_name), sr.problem_id, sr.total_score DES
 		}
 		n := float64(len(g.Submissions))
 		avgScore := g.TotalScore / n
-		var grade string
-		if avgScore >= 95 {
-			grade = "S"
-		} else if avgScore >= 90 {
-			grade = "A"
-		} else if avgScore >= 80 {
-			grade = "B"
-		} else if avgScore >= 70 {
-			grade = "C"
-		} else {
-			grade = "F"
-		}
+		grade := scorer.AssignGrade(avgScore)
 
 		subJSON, _ := json.Marshal(g.Submissions)
 
@@ -1111,6 +1109,7 @@ LIMIT 1
 		// pgx returns pgx.ErrNoRows if nothing matches, which is useful to distinguish
 		return nil, err
 	}
+	normalizeSubmissionGrade(&r)
 	return &r, nil
 }
 
@@ -1142,6 +1141,7 @@ LIMIT 1
 		return nil, err
 	}
 	r.UserID = userID
+	normalizeSubmissionGrade(&r)
 	return &r, nil
 }
 
@@ -1175,6 +1175,7 @@ LIMIT 1
 		}
 		return nil, err
 	}
+	normalizeSubmissionGrade(&r)
 	return &r, nil
 }
 
@@ -1208,6 +1209,7 @@ LIMIT 1
 		}
 		return nil, err
 	}
+	normalizeSubmissionGrade(&r)
 	return &r, nil
 }
 
@@ -1246,7 +1248,7 @@ LIMIT $2 OFFSET $3
 	}
 	defer rows.Close()
 
-	var results []SubmissionResult
+	results := make([]SubmissionResult, 0)
 	for rows.Next() {
 		var r SubmissionResult
 		if err := rows.Scan(

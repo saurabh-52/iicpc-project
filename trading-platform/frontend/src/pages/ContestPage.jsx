@@ -952,8 +952,12 @@ function ContestTableRow({ contest, type, onRegister, isRegistered, user, onEdit
           <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
             {isHost ? (
               <>
-                <button className="cw-button cw-button-secondary" style={{ padding: '4px 8px', fontSize: '0.75rem' }} onClick={() => onEdit(contest.id)}>Edit</button>
-                <button className="cw-button cw-button-secondary" style={{ padding: '4px 8px', fontSize: '0.75rem', color: '#ef4444', borderColor: 'rgba(239, 68, 68, 0.3)' }} onClick={() => onDelete(contest.id)}>Delete</button>
+                {!isEnded && contest.phase !== 'completed' && contest.phase !== 'finalizing' && (
+                  <button className="cw-button cw-button-secondary" style={{ padding: '4px 8px', fontSize: '0.75rem' }} onClick={() => onEdit(contest.id)}>Edit</button>
+                )}
+                {!isEnded && contest.phase !== 'completed' && contest.phase !== 'finalizing' && (
+                  <button className="cw-button cw-button-secondary" style={{ padding: '4px 8px', fontSize: '0.75rem', color: '#ef4444', borderColor: 'rgba(239, 68, 68, 0.3)' }} onClick={() => onDelete(contest.id)}>Delete</button>
+                )}
                 <button className="cw-button cw-button-secondary" style={{ padding: '4px 8px', fontSize: '0.75rem' }} onClick={() => navigate(`/leaderboard?contest_id=${contest.id}`)}>
                   {contest.phase === 'completed'
                     ? '📊 Final Leaderboard'

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useParams, Navigate, Link } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 
@@ -66,6 +66,19 @@ function ScoreBar({ label, value, max, color }) {
 
 function SubmissionDetail({ submission, onClose }) {
   if (!submission) return null;
+
+  const rawValidationObj = useMemo(() => {
+    if (!submission.raw_validation) return null;
+    try {
+      if (typeof submission.raw_validation === 'string') {
+        return JSON.parse(submission.raw_validation);
+      }
+      return submission.raw_validation;
+    } catch {
+      return null;
+    }
+  }, [submission.raw_validation]);
+
   return (
     <div className="detail-overlay" onClick={onClose}>
       <article className="detail-card panel" onClick={e => e.stopPropagation()}>
@@ -114,6 +127,18 @@ function SubmissionDetail({ submission, onClose }) {
             </strong>
           </div>
           <div className="metric-cell">
+            <span>Mismatches</span>
+            <strong className={rawValidationObj?.mismatch_events > 0 ? 'error-text' : ''}>
+              {rawValidationObj?.mismatch_events || 0}
+            </strong>
+          </div>
+          <div className="metric-cell">
+            <span>Unparseable</span>
+            <strong className={rawValidationObj?.unparseable_events > 0 ? 'error-text' : ''}>
+              {rawValidationObj?.unparseable_events || 0}
+            </strong>
+          </div>
+          <div className="metric-cell">
             <span>Strategy</span>
             <strong>{submission.strategy}</strong>
           </div>
@@ -139,8 +164,14 @@ export default function ProfilePage() {
   const [selectedSubmission, setSelectedSubmission] = useState(null);
 
   useEffect(() => {
+    if (!username) {
+      setError('Invalid profile URL');
+      setLoading(false);
+      return;
+    }
+
     setLoading(true);
-    fetch(`/api/users/${username}/profile?page=${page}&pageSize=${pageSize}`)
+    fetch(`/api/users/${encodeURIComponent(username)}/profile?page=${page}&pageSize=${pageSize}`)
       .then(res => {
         if (!res.ok) throw new Error('User not found or API error');
         return res.json();
@@ -178,9 +209,10 @@ export default function ProfilePage() {
 
   if (!profile) return null;
 
-  const { best_score: bestScore, history, total } = profile;
+  const { best_score: bestScore, total } = profile;
+  const history = Array.isArray(profile.history) ? profile.history : [];
   const isMe = user && user.username === username;
-  const totalPages = Math.ceil(total / pageSize) || 1;
+  const totalPages = Math.ceil((Number(total) || 0) / pageSize) || 1;
 
   return (
     <div className="dashboard-grid">

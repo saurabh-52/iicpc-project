@@ -10,15 +10,19 @@ if 'sourceCodeMap sync.Map' not in content:
         'var (\n\tdb            *store.Store\n\tredisClient   *redis.Client\n\ttelemetryHub  *ws.Hub\n\tsourceCodeMap sync.Map\n)'
     )
 
-# 2. Add runFinalization
-if 'func runFinalization(' not in content:
-    with open('patch.go', 'r') as pf:
-        patch_content = pf.read()
-    
-    # Extract just the function from patch.go
-    func_match = re.search(r'func runFinalization\(.*?\n}', patch_content, re.DOTALL)
-    if func_match:
-        func_code = func_match.group(0)
+# 2. Add or update runFinalization
+with open('patch.go', 'r') as pf:
+    patch_content = pf.read()
+
+# Extract just the function from patch.go
+func_match = re.search(r'func runFinalization\(.*', patch_content, re.DOTALL)
+if func_match:
+    func_code = func_match.group(0).strip()
+    start_idx = content.find('func runFinalization(')
+    end_idx = content.find('func main() {')
+    if start_idx != -1 and end_idx != -1:
+        content = content[:start_idx] + func_code + '\n\n' + content[end_idx:]
+    else:
         content = content.replace('func main() {', func_code + '\n\nfunc main() {')
 
 # 3. Use runFinalization in /finalize

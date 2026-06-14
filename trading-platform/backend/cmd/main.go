@@ -216,6 +216,7 @@ func runFinalization(ctx context.Context, contestID string, contest store.Contes
 			if runErr != nil {
 				log.Printf("[Finalize] Stress test failed for submission %s: %v", submissionID, runErr)
 			}
+			roundP99 = 100.0 // Set to maximum latency penalty on failure
 			return
 		}
 
@@ -336,20 +337,46 @@ func runFinalization(ctx context.Context, contestID string, contest store.Contes
 					probProtocol = strings.ToLower(strings.TrimSpace(p.HiddenProtocol))
 				}
 
+				submissionProtocol := probProtocol
+
+				// Try to get the LATEST live submission for this team+problem
+				sub, subErr := db.GetLatestLiveSubmissionForTeamAndProblem(ctx, contestID, teamName, p.ID)
+				if subErr == nil && sub != nil {
+					// 1. Detect protocol from source code
+					if len(sub.SourceCode) > 0 {
+						if proto := detectProtocolFromSourceCode([]byte(sub.SourceCode)); proto != "" {
+							submissionProtocol = proto
+						}
+					}
+					// 2. Fallback: Parse from sub.RawMetrics
+					if submissionProtocol == probProtocol && len(sub.RawMetrics) > 0 {
+						var payload struct {
+							Rounds []struct {
+								Metrics struct {
+									Protocol string `json:"protocol"`
+								} `json:"metrics"`
+							} `json:"rounds"`
+						}
+						if err := json.Unmarshal(sub.RawMetrics, &payload); err == nil && len(payload.Rounds) > 0 {
+							if pVal := strings.TrimSpace(payload.Rounds[0].Metrics.Protocol); pVal != "" {
+								submissionProtocol = strings.ToLower(pVal)
+							}
+						}
+					}
+				}
+
 				var targetURL string
 				var cleanupFunc func()
 
-				// Try to get the BEST scoring submission for this team+problem
-				sub, subErr := db.GetBestLiveSubmissionForTeamAndProblem(ctx, contestID, teamName, p.ID)
 				if subErr == nil && sub != nil && sub.SourceCode != "" {
-					log.Printf("[Finalize] Launching best engine for team %s, problem %s (%s)...", teamName, p.Code, p.Title)
-					targetURL, cleanupFunc = launchSandboxFromSource(teamName, sub.SourceCode, sub.Language, probProtocol, fmt.Sprintf("problem %s", p.Code))
+					log.Printf("[Finalize] Launching latest engine for team %s, problem %s (%s) using protocol %s...", teamName, p.Code, p.Title, submissionProtocol)
+					targetURL, cleanupFunc = launchSandboxFromSource(teamName, sub.SourceCode, sub.Language, submissionProtocol, fmt.Sprintf("problem %s", p.Code))
 				}
 
 				// Fallback: try already-running sandbox
 				if targetURL == "" {
 					log.Printf("[Finalize] Warning: could not launch sandbox for %s (problem %s), falling back to running sandbox...", teamName, p.Code)
-					targetURL, _ = sandbox.GetSandboxTargetURL(ctx, teamName, probProtocol)
+					targetURL, _ = sandbox.GetSandboxTargetURL(ctx, teamName, submissionProtocol)
 				}
 
 				if targetURL == "" {
@@ -358,7 +385,7 @@ func runFinalization(ctx context.Context, contestID string, contest store.Contes
 						allLat = append(allLat, 0.0)
 						allThr = append(allThr, 0.0)
 						allCor = append(allCor, 0.0)
-						allP99 = append(allP99, 0.0)
+						allP99 = append(allP99, 100.0) // Set to max latency penalty
 						allTPS = append(allTPS, 0.0)
 						roundResults = append(roundResults, map[string]interface{}{
 							"problem_code":  p.Code,
@@ -377,7 +404,7 @@ func runFinalization(ctx context.Context, contestID string, contest store.Contes
 						seed := botfleet.DeterministicSeedForStrategy(strategy)
 
 						roundScore, roundLat, roundThr, roundCor, roundP99, roundTPS, roundGrade := runFinalStressTest(
-							targetURL, probProtocol, submissionID, strategy, seed,
+							targetURL, submissionProtocol, submissionID, strategy, seed,
 						)
 
 						allScores = append(allScores, roundScore)
@@ -403,74 +430,7 @@ func runFinalization(ctx context.Context, contestID string, contest store.Contes
 				}
 			}
 		} else {
-			// ── No problems defined: use team's best live submission directly ──
-			log.Printf("[Finalize] No problems defined for contest %s, using best live submission for team %s", contestID, teamName)
-
-			var targetURL string
-			var cleanupFunc func()
-
-			// Try to get the team's best live submission (across all problems / the whole contest)
-			sub, subErr := db.GetLatestLiveSubmissionForTeam(ctx, contestID, teamName)
-			if subErr == nil && sub != nil && sub.SourceCode != "" {
-				log.Printf("[Finalize] Launching best engine for team %s (no-problem mode)...", teamName)
-				targetURL, cleanupFunc = launchSandboxFromSource(teamName, sub.SourceCode, sub.Language, "http", "best live")
-			}
-
-			// Fallback: try already-running sandbox
-			if targetURL == "" {
-				log.Printf("[Finalize] Warning: could not launch sandbox for %s (no-problem mode), falling back to running sandbox...", teamName)
-				targetURL, _ = sandbox.GetSandboxTargetURL(ctx, teamName, "http")
-			}
-
-			if targetURL == "" {
-				for _, stratName := range finalStrategies {
-					allScores = append(allScores, 0.0)
-					allLat = append(allLat, 0.0)
-					allThr = append(allThr, 0.0)
-					allCor = append(allCor, 0.0)
-					allP99 = append(allP99, 0.0)
-					allTPS = append(allTPS, 0.0)
-					roundResults = append(roundResults, map[string]interface{}{
-						"problem_code":  "default",
-						"problem_title": "Default Problem",
-						"strategy":      stratName,
-						"label":         fmt.Sprintf("Final - %s", stratName),
-						"score":         0.0,
-						"grade":         "F",
-						"error":         "no submission code and sandbox not running",
-					})
-				}
-			} else {
-				for i, stratName := range finalStrategies {
-					strategy := botfleet.NormalizeStrategy(stratName)
-					submissionID := fmt.Sprintf("finalize-%s-default-%d-%d", contestID, time.Now().UnixNano(), i)
-					seed := botfleet.DeterministicSeedForStrategy(strategy)
-
-					roundScore, roundLat, roundThr, roundCor, roundP99, roundTPS, roundGrade := runFinalStressTest(
-						targetURL, "http", submissionID, strategy, seed,
-					)
-
-					allScores = append(allScores, roundScore)
-					allLat = append(allLat, roundLat)
-					allThr = append(allThr, roundThr)
-					allCor = append(allCor, roundCor)
-					allP99 = append(allP99, roundP99)
-					allTPS = append(allTPS, roundTPS)
-
-					roundResults = append(roundResults, map[string]interface{}{
-						"problem_code":  "default",
-						"problem_title": "Default Problem",
-						"strategy":      stratName,
-						"label":         fmt.Sprintf("Final - %s", stratName),
-						"score":         roundScore,
-						"grade":         roundGrade,
-					})
-				}
-
-				if cleanupFunc != nil {
-					cleanupFunc()
-				}
-			}
+			log.Printf("[Finalize] WARNING: No problems defined for contest %s, skipping scoring for team %s", contestID, teamName)
 		}
 
 		avgScore, avgLat, avgThr, avgCor, avgP99, avgTPS := 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
@@ -489,7 +449,7 @@ func runFinalization(ctx context.Context, contestID string, contest store.Contes
 			avgCor /= n
 			avgP99 /= n
 			avgTPS /= n
-			if avgScore >= 95 { finalGrade = "A+" } else if avgScore >= 90 { finalGrade = "A" } else if avgScore >= 80 { finalGrade = "B" } else if avgScore >= 70 { finalGrade = "C" } else if avgScore >= 60 { finalGrade = "D" } else { finalGrade = "F" }
+			finalGrade = scorer.AssignGrade(avgScore)
 		}
 
 		mockRoundsJSONBytes, _ := json.Marshal(roundResults)
@@ -1259,7 +1219,7 @@ func main() {
 			// Aggregate scores and metrics
 			var totalScore, latencyScore, throughputScore, correctnessScore float64
 			var totalTPS, totalP99 float64
-			var totalCrossEvents, totalOrdersProcessed int
+			var totalCrossEvents, totalMismatchEvents, totalUnparseableEvents, totalOrdersProcessed int
 			var scoredCount int
 
 			for _, r := range rounds {
@@ -1276,6 +1236,8 @@ func main() {
 				}
 				if r.ValResult != nil {
 					totalCrossEvents += r.ValResult.CrossEvents
+					totalMismatchEvents += r.ValResult.MismatchEvents
+					totalUnparseableEvents += r.ValResult.UnparseableEvents
 					totalOrdersProcessed += r.ValResult.OrdersProcessed
 				}
 			}
@@ -1299,10 +1261,12 @@ func main() {
 			overallGrade := scorer.AssignGrade(avgTotalScore)
 
 			overallVal := validator.ValidationResult{
-				SubmissionID:    rounds[0].SubmissionID,
-				CrossEvents:     totalCrossEvents,
-				OrdersProcessed: totalOrdersProcessed,
-				Valid:           totalCrossEvents == 0,
+				SubmissionID:      rounds[0].SubmissionID,
+				CrossEvents:       totalCrossEvents,
+				MismatchEvents:    totalMismatchEvents,
+				UnparseableEvents: totalUnparseableEvents,
+				OrdersProcessed:   totalOrdersProcessed,
+				Valid:             totalCrossEvents == 0 && totalMismatchEvents == 0 && totalUnparseableEvents == 0,
 			}
 
 			// Package rounds in raw_metrics
@@ -1568,6 +1532,14 @@ func main() {
 				existingContest = ec
 				contestExists = true
 				log.Printf("[PublishContest] Found existing contest. ID: %s, StartTime: %v", ec.ID, ec.StartTime)
+
+				// Block editing if the contest has already finished (completed, finalizing, or past duration)
+				endTime := ec.StartTime.Add(time.Duration(ec.DurationMinutes) * time.Minute)
+				if ec.Phase == "completed" || ec.Phase == "finalizing" || time.Now().After(endTime) {
+					return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+						"message": "cannot edit contest details after it has finished",
+					})
+				}
 			}
 		}
 
@@ -1768,6 +1740,13 @@ func main() {
 		}
 		if contest.CreatedBy == "" || requesterID != contest.CreatedBy {
 			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"message": "only the contest host can delete it"})
+		}
+		// Block deletion if the contest has already finished (completed, finalizing, or past duration)
+		endTime := contest.StartTime.Add(time.Duration(contest.DurationMinutes) * time.Minute)
+		if contest.Phase == "completed" || contest.Phase == "finalizing" || time.Now().After(endTime) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"message": "cannot delete contest after it has finished",
+			})
 		}
 		if err := db.DeleteContest(c.Context(), contestID); err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "failed to delete contest", "error": err.Error()})

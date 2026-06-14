@@ -9,10 +9,11 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -36,6 +37,94 @@ type ExecutionResult struct {
 	Phase       string `json:"phase"`
 	Output      string `json:"output"`
 	NodePort    int32  `json:"node_port"`
+	// ExternalIP is the LoadBalancer IP assigned by minikube tunnel (e.g. 127.0.0.1).
+	// Empty when running in-cluster (DNS is used instead) or before tunnel assigns it.
+	ExternalIP  string `json:"external_ip,omitempty"`
+	// LocalPort is the host-side port of the kubectl port-forward process.
+	// When non-zero, traffic should be sent to 127.0.0.1:LocalPort.
+	LocalPort   int    `json:"local_port,omitempty"`
+}
+
+// portForwardRegistry tracks active kubectl port-forward processes keyed by pod ID.
+var portForwardRegistry = struct {
+	mu    sync.Mutex
+	procs map[string]*exec.Cmd
+}{
+	procs: make(map[string]*exec.Cmd),
+}
+
+// startPortForward starts `kubectl port-forward pod/<podID> localPort:containerPort`
+// and waits until the local port is reachable (up to 10 s).
+// It returns the chosen local port so callers can build the target address.
+func startPortForward(namespace, podID string, containerPort int) (int, error) {
+	// Try to bind to the same port as the container first (simpler target URL).
+	// Fall back to a random free port if that port is busy on the host.
+	localPort := containerPort
+	if ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", localPort)); err == nil {
+		ln.Close() // port is free, we'll use it
+	} else {
+		// container port is busy on host — pick any free port
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return 0, fmt.Errorf("cannot find free port: %v", err)
+		}
+		localPort = ln.Addr().(*net.TCPAddr).Port
+		ln.Close()
+	}
+
+	kubeconfigPath := ""
+	if home, err := os.UserHomeDir(); err == nil {
+		kubeconfigPath = filepath.Join(home, ".kube", "config")
+	}
+
+	args := []string{
+		"port-forward",
+		"-n", namespace,
+		"pod/" + podID,
+		fmt.Sprintf("%d:%d", localPort, containerPort),
+	}
+	if kubeconfigPath != "" {
+		args = append(args, "--kubeconfig="+kubeconfigPath)
+	}
+
+	cmd := exec.Command("kubectl", args...)
+	if err := cmd.Start(); err != nil {
+		return 0, fmt.Errorf("failed to start kubectl port-forward: %v", err)
+	}
+
+	portForwardRegistry.mu.Lock()
+	portForwardRegistry.procs[podID] = cmd
+	portForwardRegistry.mu.Unlock()
+
+	// Wait until the local port is actually accepting connections (up to 10 s).
+	addr := fmt.Sprintf("127.0.0.1:%d", localPort)
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			fmt.Printf("kubectl port-forward ready: %s → pod/%s:%d\n", addr, podID, containerPort)
+			return localPort, nil
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+
+	// Port-forward started but isn't accepting yet — still return the port.
+	// waitForTargetReachable will continue probing.
+	fmt.Printf("kubectl port-forward started (not yet ready): %s\n", addr)
+	return localPort, nil
+}
+
+// stopPortForward kills the kubectl port-forward process for the given pod ID.
+func stopPortForward(podID string) {
+	portForwardRegistry.mu.Lock()
+	cmd, ok := portForwardRegistry.procs[podID]
+	delete(portForwardRegistry.procs, podID)
+	portForwardRegistry.mu.Unlock()
+	if ok && cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}
 }
 
 // InCluster reports whether the backend is running inside a Kubernetes cluster.
@@ -126,7 +215,7 @@ func ExecuteCode(ctx context.Context, filePath string, language string, port int
 		// Clean up the failed/pending sandbox resources immediately so the port is freed
 		fmt.Printf("Cleaning up failed sandbox pod %s (phase: %s)\n", podID, phase)
 		_ = CleanupSandbox(podID)
-		
+
 		return ExecutionResult{
 			PodID:       podID,
 			ServiceName: serviceName,
@@ -143,13 +232,28 @@ func ExecuteCode(ctx context.Context, filePath string, language string, port int
 		fmt.Printf("Warning: could not retrieve NodePort for %s: %v\n", serviceName, npErr)
 	}
 
-	fmt.Printf("Kubernetes pod %s — phase: %s, NodePort: %d\n", podID, phase, nodePort)
+	// Wait for minikube tunnel to assign a LoadBalancer external IP (up to 45s).
+	// On Windows with Docker driver, `minikube tunnel` assigns 127.0.0.1 as the
+	// external IP for LoadBalancer services, making them reachable from the host.
+	// We poll here because tunnel provisioning happens asynchronously after service creation.
+	//
+	// REPLACED: minikube tunnel is unreliable on Windows Docker driver.
+	// Instead, use kubectl port-forward for guaranteed host→pod connectivity.
+	localPort, pfErr := startPortForward("trading-sandbox", podID, port)
+	if pfErr != nil {
+		fmt.Printf("Warning: kubectl port-forward failed: %v — will fall back to 127.0.0.1:%d\n", pfErr, port)
+		localPort = port
+	}
+
+	fmt.Printf("Kubernetes pod %s — phase: %s, NodePort: %d, LocalPort: %d\n", podID, phase, nodePort, localPort)
 	return ExecutionResult{
 		PodID:       podID,
 		ServiceName: serviceName,
 		Phase:       phase,
 		Output:      strings.TrimSpace(output),
 		NodePort:    nodePort,
+		ExternalIP:  "127.0.0.1",
+		LocalPort:   localPort,
 	}, nil
 }
 
@@ -215,8 +319,8 @@ func createSandboxPod(ctx context.Context, clientset *kubernetes.Clientset, file
 							corev1.ResourceMemory: resource.MustParse("256Mi"),
 						},
 						Limits: corev1.ResourceList{
-							corev1.ResourceCPU:    resource.MustParse("2"),
-							corev1.ResourceMemory: resource.MustParse("1Gi"),
+							corev1.ResourceCPU:    resource.MustParse("1"),
+							corev1.ResourceMemory: resource.MustParse("512Mi"),
 						},
 					},
 					// TCP readiness probe: the pod is considered Ready only
@@ -283,6 +387,11 @@ func createSandboxPod(ctx context.Context, clientset *kubernetes.Clientset, file
 					Protocol:   corev1.ProtocolTCP,
 				},
 			},
+			// LoadBalancer type: with `minikube tunnel` running, Kubernetes assigns
+			// ExternalIP=127.0.0.1 to this service, making it reachable from the
+			// Windows host at 127.0.0.1:<containerPort> without any extra port-forward.
+			// NodePort was tried but minikube tunnel does NOT expose NodePorts on
+			// the host — only LoadBalancer services get the 127.0.0.1 external IP.
 			Type: corev1.ServiceTypeLoadBalancer,
 		},
 	}
@@ -342,6 +451,35 @@ func getServiceNodePort(ctx context.Context, clientset *kubernetes.Clientset, na
 	}
 	return 0, fmt.Errorf("no NodePort found on service %s", serviceName)
 }
+
+// waitForServiceExternalIP polls a LoadBalancer service until minikube tunnel
+// assigns an external IP (e.g. 127.0.0.1 on Windows Docker driver) or the
+// timeout expires.  This is necessary because `minikube tunnel` provisions the
+// external IP asynchronously, after the service is created.
+func waitForServiceExternalIP(ctx context.Context, clientset *kubernetes.Clientset, namespace, serviceName string, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		default:
+		}
+		svc, err := clientset.CoreV1().Services(namespace).Get(ctx, serviceName, metav1.GetOptions{})
+		if err == nil {
+			for _, ingress := range svc.Status.LoadBalancer.Ingress {
+				if ingress.IP != "" {
+					return ingress.IP, nil
+				}
+				if ingress.Hostname != "" {
+					return ingress.Hostname, nil
+				}
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return "", fmt.Errorf("timeout waiting for LoadBalancer external IP on service %s after %s — is `minikube tunnel` running?", serviceName, timeout)
+}
+
 
 func getPodLogs(ctx context.Context, clientset *kubernetes.Clientset, namespace string, podName string) (string, error) {
 	req := clientset.CoreV1().Pods(namespace).GetLogs(podName, &corev1.PodLogOptions{})
@@ -594,6 +732,9 @@ func randomString(n int) string {
 // identified by podID.  Best-effort: collects all errors rather than failing
 // on the first one.
 func CleanupSandbox(podID string) error {
+	// Kill the kubectl port-forward process for this pod (if any).
+	stopPortForward(podID)
+
 	ctx := context.Background()
 	config, err := getKubernetesConfig()
 	if err != nil {
@@ -701,25 +842,25 @@ func buildSandboxSpec(absPath string, language string, port int) (sandboxSpec, e
 	switch normalizedLanguage {
 	case "cpp", "c++", "cc", "cxx":
 		return sandboxSpec{
-			image:   "gcc@sha256:6a251e45411969f95e57f2587563dfba89d449798b80504bcebc7fad6f210200",
+			image:   "gcc:latest",
 			command: fmt.Sprintf("g++ /app/%s -o /tmp/run && /tmp/run", fileName),
 			port:    port,
 		}, nil
 	case "go":
 		return sandboxSpec{
-			image:   "golang@sha256:87a41d2539e5671777734e91f467499ed5eafb1fb1f77221dff2744db7a51775",
+			image:   "golang:latest",
 			command: fmt.Sprintf("/usr/local/go/bin/go run /app/%s", fileName),
 			port:    port,
 		}, nil
 	case "rust":
 		return sandboxSpec{
-			image:   "rust@sha256:39d8cb39a54e7d1da665c4fabfdd265e532a5f836c11ab5aee27fd5c73891ce4",
+			image:   "rust:latest",
 			command: fmt.Sprintf("/usr/local/cargo/bin/rustc /app/%s -o /tmp/run && /tmp/run", fileName),
 			port:    port,
 		}, nil
 	case "python", "py":
 		return sandboxSpec{
-			image:   "python@sha256:401f6e1a67dad31a1bd78e9ad22d0ee0a3b52154e6bd30e90be696bb6a3d7461",
+			image:   "python:latest",
 			command: fmt.Sprintf("python /app/%s", fileName),
 			port:    port,
 		}, nil
@@ -821,7 +962,7 @@ func GetSandboxTargetURL(ctx context.Context, systemName string, protocol string
 	}
 
 	hostIP := "127.0.0.1"
-	if minikubeIP := os.Getenv("MINIKUBE_IP"); minikubeIP != "" && runtime.GOOS == "linux" {
+	if minikubeIP := os.Getenv("MINIKUBE_IP"); minikubeIP != "" {
 		hostIP = minikubeIP
 	}
 

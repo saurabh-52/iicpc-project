@@ -280,7 +280,7 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 	}
 
 	// Wait for the target to be reachable (handles service/tunnel setup latency)
-	if err := waitForTargetReachable(ctx, cfg.Target, 10*time.Second); err != nil {
+	if err := waitForTargetReachable(ctx, cfg.Target, 30*time.Second); err != nil {
 		return Summary{}, err
 	}
 	if cfg.Bots <= 0 {
@@ -1008,6 +1008,25 @@ func waitForTargetReachable(ctx context.Context, target string, timeout time.Dur
 		addr = addr[:idx]
 	}
 
+	probeAddrs := []string{addr}
+	if host, port, err := net.SplitHostPort(addr); err == nil {
+		if host == "127.0.0.1" || host == "localhost" {
+			// When target is localhost, also try minikube internal hostnames
+			probeAddrs = []string{
+				addr,
+				net.JoinHostPort("host.minikube.internal", port),
+				net.JoinHostPort("minikube", port),
+			}
+		} else {
+			// When target is a Minikube IP (e.g. 192.168.49.2:NodePort),
+			// also try localhost because `minikube tunnel` exposes NodePorts there.
+			probeAddrs = []string{
+				addr,
+				net.JoinHostPort("127.0.0.1", port),
+			}
+		}
+	}
+
 	deadline := time.Now().Add(timeout)
 	for {
 		select {
@@ -1018,13 +1037,15 @@ func waitForTargetReachable(ctx context.Context, target string, timeout time.Dur
 		if time.Now().After(deadline) {
 			break
 		}
-		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
-		if err == nil {
-			conn.Close()
-			return nil
+		for _, probeAddr := range probeAddrs {
+			conn, err := net.DialTimeout("tcp", probeAddr, 500*time.Millisecond)
+			if err == nil {
+				conn.Close()
+				return nil
+			}
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	return fmt.Errorf("timeout waiting for target %s to become reachable", target)
+	return fmt.Errorf("timeout: engine at %s was not reachable within %s (tried: %v). Ensure your server is listening on the correct port", target, timeout, probeAddrs)
 }
 

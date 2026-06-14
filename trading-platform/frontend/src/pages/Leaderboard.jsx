@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useLocation } from 'react-router-dom';
 import useWebSocket from '../hooks/useWebSocket';
 import { useAuth } from '../context/AuthContext';
@@ -97,89 +97,203 @@ function ScoreBar({ label, value, max, color }) {
   );
 }
 
-/* ── Submission Detail Modal ── */
 function SubmissionDetail({ submission, onClose }) {
   if (!submission) return null;
+
+  const [activeTab, setActiveTab] = useState('average');
+
+  const rawMetricsObj = useMemo(() => {
+    if (!submission.raw_metrics) return null;
+    try {
+      if (typeof submission.raw_metrics === 'string') {
+        return JSON.parse(submission.raw_metrics);
+      }
+      return submission.raw_metrics;
+    } catch {
+      return null;
+    }
+  }, [submission.raw_metrics]);
+
+  const rawValidationObj = useMemo(() => {
+    if (!submission.raw_validation) return null;
+    try {
+      if (typeof submission.raw_validation === 'string') {
+        return JSON.parse(submission.raw_validation);
+      }
+      return submission.raw_validation;
+    } catch {
+      return null;
+    }
+  }, [submission.raw_validation]);
+
+  const isMulti = rawMetricsObj?.is_multi_strategy;
+  const rounds = rawMetricsObj?.rounds || [];
+
+  const displaySource = useMemo(() => {
+    if (activeTab === 'average' || !isMulti) {
+      return {
+        strategy: submission.strategy,
+        grade: submission.grade,
+        total_score: submission.total_score,
+        latency_score: submission.latency_score,
+        throughput_score: submission.throughput_score,
+        correctness_score: submission.correctness_score,
+        p99_latency_ms: submission.p99_latency_ms,
+        tps: submission.tps,
+        orders_processed: submission.orders_processed,
+        cross_events: submission.cross_events,
+        mismatch_events: rawValidationObj?.mismatch_events || 0,
+        unparseable_events: rawValidationObj?.unparseable_events || 0,
+      };
+    }
+
+    const round = rounds[activeTab];
+    return {
+      strategy: round?.strategy,
+      grade: round?.score?.grade || 'F',
+      total_score: round?.score?.total_score || 0,
+      latency_score: round?.score?.latency_score || 0,
+      throughput_score: round?.score?.throughput_score || 0,
+      correctness_score: round?.score?.correctness_score || 0,
+      p99_latency_ms: round?.perf_metrics?.p99_latency_ms || round?.metrics?.p99_latency_ms || 0,
+      tps: round?.perf_metrics?.tps || round?.metrics?.requests_per_second || 0,
+      orders_processed: round?.val_result?.orders_processed || round?.metrics?.successes || 0,
+      cross_events: round?.val_result?.cross_events || 0,
+      mismatch_events: round?.val_result?.mismatch_events || 0,
+      unparseable_events: round?.val_result?.unparseable_events || 0,
+    };
+  }, [activeTab, submission, rounds, isMulti, rawValidationObj]);
+
+  const displayName = (entry) => {
+    if (entry.system_name && entry.system_name.trim()) return entry.system_name;
+    return entry.submission_id?.slice(0, 18) || '—';
+  };
+
   return (
-    <div className="detail-overlay" onClick={onClose} style={{ zIndex: 110 }}>
-      <article className="detail-card panel" onClick={e => e.stopPropagation()}>
-        <div className="detail-header">
+    <div className="detail-overlay" onClick={onClose} style={{
+      position: 'fixed', inset: 0, zIndex: 1000,
+      background: 'rgba(15, 23, 42, 0.4)', backdropFilter: 'blur(4px)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '1rem'
+    }}>
+      <article className="detail-card panel" onClick={e => e.stopPropagation()} style={{
+        background: '#fff', padding: '2rem', borderRadius: '16px', maxWidth: '36rem', width: '100%',
+        boxShadow: 'var(--shadow)', border: '1px solid rgba(148, 163, 184, 0.2)'
+      }}>
+        <div className="detail-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '1.25rem' }}>
           <div>
-            <span className="section-tag">Submission Detail</span>
-            <h3>{displayName(submission)}</h3>
-            <span className="detail-strategy-tag">{strategyLabel(submission.strategy)}</span>
+            <span className="section-tag" style={{ fontSize: '0.7rem', color: 'var(--muted)', display: 'block', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Submission Detail</span>
+            <h3 style={{ margin: '0.25rem 0 0 0', fontSize: '1.35rem', color: 'var(--text-h)' }}>{displayName(submission)}</h3>
+            <span className="detail-strategy-tag" style={{ display: 'inline-block', fontSize: '0.78rem', background: 'rgba(99,102,241,0.08)', color: '#6366f1', padding: '2px 8px', borderRadius: '6px', marginTop: '0.5rem', fontWeight: 600 }}>
+              {strategyLabel(displaySource.strategy)}
+            </span>
           </div>
-          <button className="detail-close" onClick={onClose} aria-label="Close">✕</button>
+          <button className="detail-close" onClick={onClose} aria-label="Close" style={{ background: 'none', border: 'none', fontSize: '1.25rem', cursor: 'pointer', color: 'var(--text)' }}>✕</button>
         </div>
 
-        <div className="detail-scores">
-          <div className="detail-total">
-            <GradeBadge grade={submission.grade} />
+        {isMulti && (
+          <div className="multi-strategy-tabs" style={{ display: 'flex', gap: '0.35rem', marginBottom: '1.25rem', overflowX: 'auto', paddingBottom: '6px', borderBottom: '1px solid rgba(148, 163, 184, 0.12)' }}>
+            <button
+              onClick={() => setActiveTab('average')}
+              style={{
+                padding: '6px 12px',
+                borderRadius: '6px',
+                border: 'none',
+                cursor: 'pointer',
+                fontSize: '0.78rem',
+                fontWeight: '600',
+                background: activeTab === 'average' ? 'linear-gradient(135deg, #6366f1 0%, #4f46e5 100%)' : 'rgba(15,23,42,0.03)',
+                color: activeTab === 'average' ? '#fff' : 'var(--text-h)',
+                transition: 'all 0.2s',
+                boxShadow: activeTab === 'average' ? '0 2px 6px rgba(99, 102, 241, 0.2)' : 'none',
+              }}
+            >
+              Summary (Average)
+            </button>
+            {rounds.map((round, idx) => (
+              <button
+                key={idx}
+                onClick={() => setActiveTab(idx)}
+                style={{
+                  padding: '6px 12px',
+                  borderRadius: '6px',
+                  border: 'none',
+                  cursor: 'pointer',
+                  fontSize: '0.78rem',
+                  fontWeight: '600',
+                  background: activeTab === idx ? 'linear-gradient(135deg, #6366f1 0%, #4f46e5 100%)' : 'rgba(15,23,42,0.03)',
+                  color: activeTab === idx ? '#fff' : 'var(--text-h)',
+                  transition: 'all 0.2s',
+                  boxShadow: activeTab === idx ? '0 2px 6px rgba(99, 102, 241, 0.2)' : 'none',
+                  whiteSpace: 'nowrap'
+                }}
+              >
+                {strategyLabel(round.strategy)}
+              </button>
+            ))}
+          </div>
+        )}
+
+        <div className="detail-scores" style={{ marginBottom: '1.25rem' }}>
+          <div className="detail-total" style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginBottom: '1rem' }}>
+            <GradeBadge grade={displaySource.grade} />
             <div className="detail-total-num">
-              <strong>{submission.total_score.toFixed(1)}</strong>
+              <strong>{displaySource.total_score?.toFixed(1) || '0.0'}</strong>
               <span>/100</span>
             </div>
           </div>
 
-          <div className="detail-breakdown">
-            {submission.judging_mode === 'contest_final' ? (
+          <div className="detail-breakdown" style={{ display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
+            {isMulti ? (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', flex: 1 }}>
                 <strong style={{ fontSize: '0.85rem', color: 'var(--text-dim)' }}>Round Scores</strong>
-                {(submission.round_scores || []).map((rs, i) => (
-                  <ScoreBar key={i} label={rs.label} value={rs.score} max={100} color="#8b5cf6" />
+                {(rawMetricsObj?.rounds || []).map((rs, i) => (
+                  <ScoreBar key={i} label={rs.label || strategyLabel(rs.strategy)} value={rs.score?.total_score ?? rs.total_score ?? 0} max={100} color="#8b5cf6" />
                 ))}
               </div>
             ) : (
               <>
-                <ScoreBar label="Latency" value={submission.latency_score} max={25} color="#3b82f6" />
-                <ScoreBar label="Throughput" value={submission.throughput_score} max={25} color="#10b981" />
-                <ScoreBar label="Correctness" value={submission.correctness_score} max={50} color="#f59e0b" />
+                <ScoreBar label="Latency" value={displaySource.latency_score || 0} max={25} color="#3b82f6" />
+                <ScoreBar label="Throughput" value={displaySource.throughput_score || 0} max={25} color="#10b981" />
+                <ScoreBar label="Correctness" value={displaySource.correctness_score || 0} max={50} color="#f59e0b" />
               </>
             )}
           </div>
         </div>
 
-        {submission.judging_mode === 'contest_final' ? (
-          <div className="detail-metrics" style={{ gridTemplateColumns: '1fr 1fr' }}>
-            <div className="metric-cell">
-              <span>Strategy</span>
-              <strong>{strategyLabel(submission.strategy)}</strong>
-            </div>
-            <div className="metric-cell">
-              <span>Finalized At</span>
-              <strong>{new Date(submission.submitted_at).toLocaleString()}</strong>
-            </div>
+        <div className="detail-metrics" style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: '0.75rem' }}>
+          <div className="metric-cell" style={{ background: 'rgba(15,23,42,0.02)', padding: '0.9rem 1rem', borderRadius: '0.85rem', border: '1px solid rgba(148,163,184,0.12)' }}>
+            <span style={{ display: 'block', fontSize: '0.75rem', color: 'var(--muted)', marginBottom: '0.25rem' }}>P99 Latency</span>
+            <strong>{formatLatency(displaySource.p99_latency_ms || 0)}</strong>
           </div>
-        ) : (
-          <div className="detail-metrics">
-            <div className="metric-cell">
-              <span>P99 Latency</span>
-              <strong>{formatLatency(submission.p99_latency_ms)}</strong>
-            </div>
-            <div className="metric-cell">
-              <span>TPS</span>
-              <strong>{formatTPS(submission.tps)}</strong>
-            </div>
-            <div className="metric-cell">
-              <span>Orders</span>
-              <strong>{(submission.orders_processed || 0).toLocaleString()}</strong>
-            </div>
-            <div className="metric-cell">
-              <span>Crosses</span>
-              <strong className={submission.cross_events > 0 ? 'error-text' : ''}>
-                {submission.cross_events || 0}
-              </strong>
-            </div>
-            <div className="metric-cell">
-              <span>Strategy</span>
-              <strong>{strategyLabel(submission.strategy)}</strong>
-            </div>
-            <div className="metric-cell">
-              <span>Submitted</span>
-              <strong>{new Date(submission.submitted_at).toLocaleString()}</strong>
-            </div>
+          <div className="metric-cell" style={{ background: 'rgba(15,23,42,0.02)', padding: '0.9rem 1rem', borderRadius: '0.85rem', border: '1px solid rgba(148,163,184,0.12)' }}>
+            <span style={{ display: 'block', fontSize: '0.75rem', color: 'var(--muted)', marginBottom: '0.25rem' }}>TPS</span>
+            <strong>{formatTPS(displaySource.tps || 0)}</strong>
           </div>
-        )}
+          <div className="metric-cell" style={{ background: 'rgba(15,23,42,0.02)', padding: '0.9rem 1rem', borderRadius: '0.85rem', border: '1px solid rgba(148,163,184,0.12)' }}>
+            <span style={{ display: 'block', fontSize: '0.75rem', color: 'var(--muted)', marginBottom: '0.25rem' }}>Orders</span>
+            <strong>{(displaySource.orders_processed || 0).toLocaleString()}</strong>
+          </div>
+          <div className="metric-cell" style={{ background: 'rgba(15,23,42,0.02)', padding: '0.9rem 1rem', borderRadius: '0.85rem', border: '1px solid rgba(148,163,184,0.12)' }}>
+            <span style={{ display: 'block', fontSize: '0.75rem', color: 'var(--muted)', marginBottom: '0.25rem' }}>Crosses</span>
+            <strong className={displaySource.cross_events > 0 ? 'error-text' : ''}>{displaySource.cross_events || 0}</strong>
+          </div>
+          <div className="metric-cell" style={{ background: 'rgba(15,23,42,0.02)', padding: '0.9rem 1rem', borderRadius: '0.85rem', border: '1px solid rgba(148,163,184,0.12)' }}>
+            <span style={{ display: 'block', fontSize: '0.75rem', color: 'var(--muted)', marginBottom: '0.25rem' }}>Mismatches</span>
+            <strong className={displaySource.mismatch_events > 0 ? 'error-text' : ''}>{displaySource.mismatch_events || 0}</strong>
+          </div>
+          <div className="metric-cell" style={{ background: 'rgba(15,23,42,0.02)', padding: '0.9rem 1rem', borderRadius: '0.85rem', border: '1px solid rgba(148,163,184,0.12)' }}>
+            <span style={{ display: 'block', fontSize: '0.75rem', color: 'var(--muted)', marginBottom: '0.25rem' }}>Unparseable</span>
+            <strong className={displaySource.unparseable_events > 0 ? 'error-text' : ''}>{displaySource.unparseable_events || 0}</strong>
+          </div>
+          <div className="metric-cell" style={{ background: 'rgba(15,23,42,0.02)', padding: '0.9rem 1rem', borderRadius: '0.85rem', border: '1px solid rgba(148,163,184,0.12)' }}>
+            <span style={{ display: 'block', fontSize: '0.75rem', color: 'var(--muted)', marginBottom: '0.25rem' }}>Strategy</span>
+            <strong>{strategyLabel(displaySource.strategy)}</strong>
+          </div>
+          <div className="metric-cell" style={{ background: 'rgba(15,23,42,0.02)', padding: '0.9rem 1rem', borderRadius: '0.85rem', border: '1px solid rgba(148,163,184,0.12)' }}>
+            <span style={{ display: 'block', fontSize: '0.75rem', color: 'var(--muted)', marginBottom: '0.25rem' }}>Submitted</span>
+            <strong>{new Date(submission.submitted_at).toLocaleString()}</strong>
+          </div>
+        </div>
       </article>
     </div>
   );

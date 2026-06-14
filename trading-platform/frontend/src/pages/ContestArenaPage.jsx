@@ -120,6 +120,18 @@ function SubmissionDetail({ submission, onClose }) {
     }
   }, [submission.raw_metrics]);
 
+  const rawValidationObj = useMemo(() => {
+    if (!submission.raw_validation) return null;
+    try {
+      if (typeof submission.raw_validation === 'string') {
+        return JSON.parse(submission.raw_validation);
+      }
+      return submission.raw_validation;
+    } catch {
+      return null;
+    }
+  }, [submission.raw_validation]);
+
   const isMulti = rawMetricsObj?.is_multi_strategy;
   const rounds = rawMetricsObj?.rounds || [];
 
@@ -136,6 +148,8 @@ function SubmissionDetail({ submission, onClose }) {
         tps: submission.tps,
         orders_processed: submission.orders_processed,
         cross_events: submission.cross_events,
+        mismatch_events: rawValidationObj?.mismatch_events || 0,
+        unparseable_events: rawValidationObj?.unparseable_events || 0,
       };
     }
     const r = rounds[activeTab];
@@ -150,8 +164,10 @@ function SubmissionDetail({ submission, onClose }) {
       tps: r?.perf_metrics?.tps || r?.metrics?.requests_per_second || 0,
       orders_processed: r?.val_result?.orders_processed || r?.metrics?.successes || 0,
       cross_events: r?.val_result?.cross_events || 0,
+      mismatch_events: r?.val_result?.mismatch_events || 0,
+      unparseable_events: r?.val_result?.unparseable_events || 0,
     };
-  }, [activeTab, submission, rounds, isMulti]);
+  }, [activeTab, submission, rounds, isMulti, rawValidationObj]);
 
   const displayName = (entry) => {
     if (entry.system_name && entry.system_name.trim()) return entry.system_name;
@@ -255,6 +271,18 @@ function SubmissionDetail({ submission, onClose }) {
             <span style={{ fontSize: '0.75rem', color: 'var(--muted)' }}>Crosses</span>
             <strong style={{ fontSize: '0.95rem', color: displaySource.cross_events > 0 ? '#ef4444' : 'var(--text-h)' }}>
               {displaySource.cross_events || 0}
+            </strong>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column' }}>
+            <span style={{ fontSize: '0.75rem', color: 'var(--muted)' }}>Mismatches</span>
+            <strong style={{ fontSize: '0.95rem', color: displaySource.mismatch_events > 0 ? '#ef4444' : 'var(--text-h)' }}>
+              {displaySource.mismatch_events || 0}
+            </strong>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column' }}>
+            <span style={{ fontSize: '0.75rem', color: 'var(--muted)' }}>Unparseable</span>
+            <strong style={{ fontSize: '0.95rem', color: displaySource.unparseable_events > 0 ? '#ef4444' : 'var(--text-h)' }}>
+              {displaySource.unparseable_events || 0}
             </strong>
           </div>
           <div style={{ display: 'flex', flexDirection: 'column' }}>

@@ -83,6 +83,19 @@ function ScoreBar({ label, value, max, color }) {
 
 function SubmissionDetail({ submission, onClose }) {
   if (!submission) return null;
+
+  const rawValidationObj = useMemo(() => {
+    if (!submission.raw_validation) return null;
+    try {
+      if (typeof submission.raw_validation === 'string') {
+        return JSON.parse(submission.raw_validation);
+      }
+      return submission.raw_validation;
+    } catch {
+      return null;
+    }
+  }, [submission.raw_validation]);
+
   const displayName = (entry) => {
     if (entry.system_name && entry.system_name.trim()) return entry.system_name;
     return entry.submission_id?.slice(0, 18) || '—';
@@ -132,6 +145,18 @@ function SubmissionDetail({ submission, onClose }) {
             <span>Crosses</span>
             <strong className={submission.cross_events > 0 ? 'error-text' : ''}>
               {submission.cross_events || 0}
+            </strong>
+          </div>
+          <div className="metric-cell">
+            <span>Mismatches</span>
+            <strong className={rawValidationObj?.mismatch_events > 0 ? 'error-text' : ''}>
+              {rawValidationObj?.mismatch_events || 0}
+            </strong>
+          </div>
+          <div className="metric-cell">
+            <span>Unparseable</span>
+            <strong className={rawValidationObj?.unparseable_events > 0 ? 'error-text' : ''}>
+              {rawValidationObj?.unparseable_events || 0}
             </strong>
           </div>
           <div className="metric-cell">
